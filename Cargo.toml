@@ -1,0 +1,17 @@
+[package]
+name = "concordium-e2e"
+version = "0.1.0"
+edition = "2021"
+description = "Automated end-to-end test suite for the Concordium node"
+
+[[bin]]
+name = "concordium-e2e"
+path = "src/main.rs"
+
+[dependencies]
+concordium-rust-sdk = { path = "concordium-rust-sdk" }
+clap    = { version = "4", features = ["derive", "env"] }
+anyhow  = "1.0"
+tokio   = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
