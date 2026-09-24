@@ -1,0 +1,61 @@
+name: E2E
+run-name: E2E — ${{ inputs.node_image }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_image:
+        description: Public Concordium Node image reference (tag or digest)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: Run E2E tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CONCORDIUM_NODE_IMAGE: ${{ inputs.node_image }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Restore Rust build cache
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Record run details
+        env:
+          TESTED_COMMIT: ${{ github.sha }}
+        run: |
+          {
+            echo "## E2E test run"
+            echo
+            echo "- Node image: \`$CONCORDIUM_NODE_IMAGE\`"
+            echo "- E2E testing commit: \`$TESTED_COMMIT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build E2E test suite
+        run: cargo build --release --locked
+
+      - name: Pull Concordium Node image
+        run: docker pull -- "$CONCORDIUM_NODE_IMAGE"
+
+      - name: Run E2E tests
+        run: target/release/concordium-e2e
