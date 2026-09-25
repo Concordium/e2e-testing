@@ -30,10 +30,19 @@ The binary is written to `target/release/concordium-e2e`.
 
 ## Usage
 
-Run the following command for full description:
+For example, pull the latest testnet node image, then run the test suite with
+it. The fixture automatically selects an available host port for the node's
+gRPC endpoint:
 
 ```sh
-concordium-e2e --help
+docker pull concordium/testnet-node:latest
+cargo run --release -- --image concordium/testnet-node:latest
+```
+
+Run the following command for a full description of the available options:
+
+```sh
+cargo run -- --help
 ```
 
 ## Exit codes

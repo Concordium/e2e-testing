@@ -19,10 +19,6 @@ struct Args {
     #[arg(long, env = "CONCORDIUM_NODE_IMAGE", value_name = "IMAGE")]
     image: String,
 
-    /// gRPC port exposed by the node container on the host.
-    #[arg(long, default_value_t = 20000, value_name = "PORT")]
-    grpc_port: u16,
-
     /// Run only tests whose names contain FILTER (case-insensitive substring match).
     #[arg(long, value_name = "FILTER")]
     filter: Option<String>,
@@ -39,9 +35,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    tracing::info!(image = %args.image, grpc_port = args.grpc_port, "starting e2e suite");
+    tracing::info!(image = %args.image, "starting e2e suite");
 
-    let results = runner::run(&args.image, args.grpc_port, args.filter.as_deref()).await?;
+    let results = runner::run(&args.image, args.filter.as_deref()).await?;
 
     runner::print_summary(&results);
 
