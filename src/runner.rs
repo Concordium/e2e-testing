@@ -51,10 +51,22 @@ pub struct Fixtures {
 ///   (case-insensitive) are executed.
 ///
 /// Always stops the node container before returning, regardless of outcome.
-pub async fn run(image: &str, grpc_port: u16, filter: Option<&str>) -> Result<Vec<TestResult>> {
+pub async fn run(image: &str, filter: Option<&str>) -> Result<Vec<TestResult>> {
     // ── Connect to Docker daemon ──────────────────────────────────────────
     let docker =
         Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
+
+    // Install signal handlers before creating any Docker resources. A signal
+    // received during startup is retained until the container can be cleaned up.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(());
+    });
+    let mut shutdown = Box::pin(async move {
+        let _ = shutdown_rx.await;
+    });
+    tokio::task::yield_now().await;
 
     // ── Step 1: Generate genesis ──────────────────────────────────────────────
     tracing::info!("generating genesis block...");
@@ -76,12 +88,11 @@ pub async fn run(image: &str, grpc_port: u16, filter: Option<&str>) -> Result<Ve
         serde_json::to_vec_pretty(&*credentials)
             .context("Failed serializing validator credentials")?
     };
-    tracing::info!(image, grpc_port, "starting node container...");
+    tracing::info!(image, "starting node container...");
     let mut node = NodeFixture::start(
         &docker,
         NodeConfig {
             image: image.to_string(),
-            grpc_port,
             genesis_bytes: concordium_rust_sdk::genesis::serialize_genesis(&genesis.genesis_data),
             validator_credentials: Some(validator_credentials),
         },
@@ -89,11 +100,19 @@ pub async fn run(image: &str, grpc_port: u16, filter: Option<&str>) -> Result<Ve
     .await?;
 
     // ── Step 3: Wait for readiness (health + block) ───────────────────────────
-    let readiness_result = node.wait_until_ready().await;
-    if let Err(ref e) = readiness_result {
-        tracing::error!("node did not become ready: {e}");
+    let readiness_result = tokio::select! {
+        result = node.wait_until_ready() => result,
+        _ = &mut shutdown => {
+            node.log_output(&docker).await;
+            let _ = node.stop(&docker).await;
+            anyhow::bail!("received termination signal during node startup");
+        }
+    };
+    if let Err(error) = readiness_result {
+        tracing::error!("node did not become ready: {error}");
+        node.log_output(&docker).await;
         let _ = node.stop(&docker).await;
-        return Err(readiness_result.unwrap_err());
+        return Err(error);
     }
 
     let fixtures = Fixtures {
@@ -105,6 +124,7 @@ pub async fn run(image: &str, grpc_port: u16, filter: Option<&str>) -> Result<Ve
     let tests = crate::tests::all_tests();
     let mut results = Vec::new();
 
+    let mut interrupted = false;
     for test in tests {
         if let Some(f) = filter {
             if !test.name.to_lowercase().contains(&f.to_lowercase()) {
@@ -113,13 +133,19 @@ pub async fn run(image: &str, grpc_port: u16, filter: Option<&str>) -> Result<Ve
         }
 
         tracing::info!(test = test.name, "running test");
-        let outcome =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), (test.run)(&fixtures))
-                .await
-            {
+        let outcome = tokio::select! {
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                (test.run)(&fixtures),
+            ) => match result {
                 Ok(outcome) => outcome,
                 Err(_) => Err(anyhow::anyhow!("{} timed out after 30 seconds", test.name)),
-            };
+            },
+            _ = &mut shutdown => {
+                interrupted = true;
+                break;
+            }
+        };
         let result = match outcome {
             Ok(()) => {
                 tracing::info!(test = test.name, "PASS");
@@ -146,11 +172,33 @@ pub async fn run(image: &str, grpc_port: u16, filter: Option<&str>) -> Result<Ve
         tracing::warn!("error during node teardown: {e}");
     }
 
+    if interrupted {
+        anyhow::bail!("received termination signal during test execution");
+    }
+
     if results.is_empty() {
         tracing::info!("no tests registered — nothing to run");
     }
 
     Ok(results)
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler must be installable");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Ctrl-C handler must be installable");
 }
 
 /// Print a human-readable summary of the test run to stdout.

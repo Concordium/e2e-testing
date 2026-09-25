@@ -10,6 +10,11 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const VALIDATOR_BALANCE: Amount = Amount::from_micro_ccd(3_500_000_000_000);
 
+/// Verify the validator's genesis state before any transaction is submitted.
+///
+/// This test assumes that it runs before the transfer test and before the first
+/// payday. Only empty blocks can exist at this point. Therefore, transaction
+/// fees and payday rewards cannot have changed the validator's genesis balance.
 pub async fn validator_account_exists(fixtures: &Fixtures) -> anyhow::Result<()> {
     let address = fixtures.genesis.accounts[0].lock().await.address;
 
