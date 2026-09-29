@@ -77,6 +77,19 @@ impl NodeFixture {
             .context("Failed to write validator-credentials.json")?;
         };
 
+        // Run the container as the owner of the bind-mounted directory. This
+        // supports images that default to either root or an unprivileged user.
+        #[cfg(unix)]
+        let container_user = {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = std::fs::metadata(temp_dir.path())
+                .context("Failed to inspect node data directory")?;
+            Some(format!("{}:{}", metadata.uid(), metadata.gid()))
+        };
+        #[cfg(not(unix))]
+        let container_user: Option<String> = None;
+
         // Let Docker select an available host port for the container's gRPC port.
         let port_key = format!("{CONTAINER_GRPC_PORT}/tcp");
         let port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::from([(
@@ -108,9 +121,14 @@ impl NodeFixture {
 
         let container_config = ContainerCreateBody {
             image: Some(config.image.clone()),
-            // Official Concordium network images default to an interactive
-            // shell and ship the node executable at this fixed path.
-            cmd: Some(vec!["/concordium-node".to_string()]),
+            user: container_user,
+            // Support both the root-level path in the network-specific images
+            // and the PATH-based command in the combined image.
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "if command -v concordium-node >/dev/null 2>&1; then exec concordium-node; else exec /concordium-node; fi".to_string(),
+            ]),
             env: Some(env),
             exposed_ports: Some(vec![port_key.clone()]),
             host_config: Some(HostConfig {
