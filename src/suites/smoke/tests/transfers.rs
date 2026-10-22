@@ -1,8 +1,8 @@
-use crate::runner::Fixtures;
-use anyhow::{ensure, Context};
+use super::super::Fixtures;
+use anyhow::{Context, ensure};
 use concordium_rust_sdk::{
     common::types::{Amount, TransactionTime},
-    types::transactions::{send, BlockItem},
+    types::transactions::{BlockItem, send},
     v2::BlockIdentifier,
 };
 use std::time::Duration;
@@ -11,10 +11,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSFER_AMOUNT: Amount = Amount::from_micro_ccd(1_000_000);
 
 pub async fn ccd_transfer_is_finalised(fixtures: &Fixtures) -> anyhow::Result<()> {
-    // Keep exclusive access from the live nonce read through finalisation and
-    // post-state checks, so no other test can submit with this account.
-    let sender = fixtures.genesis.accounts[1].lock().await;
-    let recipient_address = fixtures.genesis.accounts[0].lock().await.address;
+    let sender = &fixtures.genesis.accounts[1];
+    let recipient_address = fixtures.genesis.accounts[0].address;
 
     let mut client = fixtures.validator_node.connect().await?;
     let recipient_before = client

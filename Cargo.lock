@@ -690,8 +690,10 @@ dependencies = [
  "concordium-rust-sdk",
  "futures-util",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2905,6 +2907,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
