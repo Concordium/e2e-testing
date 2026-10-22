@@ -684,12 +684,14 @@ name = "concordium-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bollard",
  "chrono",
  "clap",
  "concordium-rust-sdk",
  "futures-util",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

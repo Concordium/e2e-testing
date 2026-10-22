@@ -1,13 +1,16 @@
-//! Test runner — orchestrates fixture setup, test execution, and teardown.
+//! Smoke suite — fixture setup, independent checks, and teardown.
 //!
 //! Sequence:
-//! 1. Generate a fresh genesis block via [`fixture::genesis`].
-//! 2. Start a node container via [`fixture::node`].
+//! 1. Generate a fresh genesis block via [`crate::fixture::genesis`].
+//! 2. Start a node container via [`crate::fixture::node`].
 //! 3. Wait for the node to become ready (healthy + first block).
 //! 4. Run each registered test in order, collecting results.
 //! 5. Stop the container and delete temp files — always, even on failure.
 //! 6. Return results to `main` for summary and exit code.
 
+mod tests;
+
+use super::shutdown_signal;
 use crate::fixture::{
     genesis::GenesisFixture,
     node::{NodeConfig, NodeFixture},
@@ -28,18 +31,20 @@ pub struct TestResult {
 
 use std::{future::Future, pin::Pin};
 
+/// A test operation that can borrow the suite fixtures.
 pub type TestFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 
-/// A test function: receives a reference to the running node fixture and
-/// returns a result. The name is used in the summary output.
+/// One named smoke check. The runner records its result before the next check.
 pub struct Test {
+    /// Name used in logs and the result summary.
     pub name: &'static str,
+    /// Run this check against the suite's shared chain.
     pub run: Box<dyn for<'a> Fn(&'a Fixtures) -> TestFuture<'a> + Send>,
 }
 
-/// Test fixtures available to tests
+/// Genesis keys and the running node shared by smoke checks.
 pub struct Fixtures {
-    /// Genesis information, contains accounts, validators, identity providers and so on.
+    /// Genesis accounts and keys used to sign test transactions.
     pub(crate) genesis: GenesisFixture,
     /// The running validator node.
     pub(crate) validator_node: NodeFixture,
@@ -47,11 +52,8 @@ pub struct Fixtures {
 
 /// Run the full test suite against the given node image.
 ///
-/// * `filter` — if `Some`, only tests whose names contain the substring
-///   (case-insensitive) are executed.
-///
 /// Always stops the node container before returning, regardless of outcome.
-pub async fn run(image: &str, filter: Option<&str>) -> Result<Vec<TestResult>> {
+pub async fn run(image: &str) -> Result<Vec<TestResult>> {
     // ── Connect to Docker daemon ──────────────────────────────────────────
     let docker =
         Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
@@ -70,7 +72,7 @@ pub async fn run(image: &str, filter: Option<&str>) -> Result<Vec<TestResult>> {
 
     // ── Step 1: Generate genesis ──────────────────────────────────────────────
     tracing::info!("generating genesis block...");
-    let genesis = GenesisFixture::single_validator()?;
+    let genesis = GenesisFixture::single_validator_p10()?;
     tracing::info!(
         validators = genesis.validators.len(),
         accounts = genesis.accounts.len(),
@@ -121,17 +123,11 @@ pub async fn run(image: &str, filter: Option<&str>) -> Result<Vec<TestResult>> {
     };
 
     // ── Step 4: Collect and run tests ─────────────────────────────────────────
-    let tests = crate::tests::all_tests();
+    let tests = tests::all_tests();
     let mut results = Vec::new();
 
     let mut interrupted = false;
     for test in tests {
-        if let Some(f) = filter {
-            if !test.name.to_lowercase().contains(&f.to_lowercase()) {
-                continue;
-            }
-        }
-
         tracing::info!(test = test.name, "running test");
         let outcome = tokio::select! {
             result = tokio::time::timeout(
@@ -169,7 +165,7 @@ pub async fn run(image: &str, filter: Option<&str>) -> Result<Vec<TestResult>> {
 
     // ── Step 5: Teardown (always) ─────────────────────────────────────────────
     if let Err(e) = fixtures.validator_node.stop(&docker).await {
-        tracing::warn!("error during node teardown: {e}");
+        return Err(e.context("Smoke suite teardown failed"));
     }
 
     if interrupted {
@@ -181,24 +177,6 @@ pub async fn run(image: &str, filter: Option<&str>) -> Result<Vec<TestResult>> {
     }
 
     Ok(results)
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler must be installable");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
-    }
-
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Ctrl-C handler must be installable");
 }
 
 /// Print a human-readable summary of the test run to stdout.

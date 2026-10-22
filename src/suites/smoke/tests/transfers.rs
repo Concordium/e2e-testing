@@ -1,8 +1,8 @@
-use crate::runner::Fixtures;
-use anyhow::{ensure, Context};
+use super::super::Fixtures;
+use anyhow::{Context, ensure};
 use concordium_rust_sdk::{
     common::types::{Amount, TransactionTime},
-    types::transactions::{send, BlockItem},
+    types::transactions::{BlockItem, send},
     v2::BlockIdentifier,
 };
 use std::time::Duration;

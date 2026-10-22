@@ -1,9 +1,11 @@
 # Concordium Node E2E Test Suite
 
-Automated end-to-end test suite for the Concordium node. Spins up a fresh
-private single-validator chain from a programmatically generated genesis block,
-runs a suite of tests against the node's full external interface, and tears
-everything down — regardless of outcome.
+End-to-end suites for the Concordium node. Each suite generates a fresh private
+chain and cleans up its Docker resources regardless of outcome:
+
+- **Smoke:** single-validator chain with basic node-interface checks.
+- **P10 → P11 continuity:** four validators and an observer, rolling software
+  upgrades, prepared state, protocol activation and observer recovery.
 
 ## Prerequisites
 
@@ -30,16 +32,41 @@ The binary is written to `target/release/concordium-e2e`.
 
 ## Usage
 
-For example, pull the latest testnet node image, then run the test suite with
-it. The fixture automatically selects an available host port for the node's
-gRPC endpoint:
+Make the required node images available to Docker before running a suite.
+Replace the image placeholders below with Docker image references.
+
+### Smoke
+
+Checks basic node behavior and connectivity. Use this suite for a quick check
+of a node image.
 
 ```sh
-docker pull concordium/testnet-node:latest
-cargo run --release -- --image concordium/testnet-node:latest
+cargo run --release -- smoke --image NODE_IMAGE
 ```
 
-Run the following command for a full description of the available options:
+### P10 → P11 continuity
+
+The suite starts a private P10 chain with four validators and an observer, then
+upgrades validators one at a time while checking that finalization and CCD
+transfers continue. During mixed-version operation, it prepares CCD, delegation
+and token state; after all validators are upgraded, it submits a governance
+update to activate P11 and checks that this state is preserved. It then runs fresh
+CCD and token transfers at P11, verifies that the old observer cannot follow the
+update, and upgrades the observer using its existing database. Finally, it checks
+that all five nodes agree on saved finalized state and cleans up the network.
+
+```sh
+cargo run --release -- protocol-p10-p11 \
+  --old-image P10_NODE_IMAGE --new-image P11_NODE_IMAGE
+```
+
+See the [protocol suite documentation](docs/protocol-p10-p11.md) for image
+compatibility requirements.
+
+### Available options
+
+List the suites and options with `--help`. Add `--help` to a suite command for
+its options.
 
 ```sh
 cargo run -- --help
