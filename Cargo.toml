@@ -1,7 +1,7 @@
 [package]
 name = "concordium-e2e"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Automated end-to-end test suite for the Concordium node"
 
 [[bin]]
@@ -12,11 +12,13 @@ path = "src/main.rs"
 concordium-rust-sdk = { path = "concordium-rust-sdk" }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1.0"
+async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 serde_json = "1.0"
+sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 bollard = "0.21"
 futures-util = "0.3"

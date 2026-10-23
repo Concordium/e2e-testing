@@ -1,28 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod cli;
 mod fixture;
-mod runner;
-mod tests;
-
-/// Automated end-to-end test suite for the Concordium node.
-///
-/// Spins up a fresh private single-validator chain, runs the test suite
-/// against it, then tears the chain down — regardless of outcome.
-#[derive(Debug, Parser)]
-#[command(name = "concordium-e2e", version, about, long_about = None)]
-struct Args {
-    /// Docker image for the Concordium node under test
-    /// (e.g. `concordium-node:7.0.4`).
-    ///
-    /// May also be supplied via the CONCORDIUM_NODE_IMAGE environment variable.
-    #[arg(long, env = "CONCORDIUM_NODE_IMAGE", value_name = "IMAGE")]
-    image: String,
-
-    /// Run only tests whose names contain FILTER (case-insensitive substring match).
-    #[arg(long, value_name = "FILTER")]
-    filter: Option<String>,
-}
+mod suites;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,16 +14,19 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
-
-    tracing::info!(image = %args.image, "starting e2e suite");
-
-    let results = runner::run(&args.image, args.filter.as_deref()).await?;
-
-    runner::print_summary(&results);
-
-    if results.iter().any(|r| !r.passed) {
-        std::process::exit(1);
+    match cli::Cli::parse()
+        .suite()
+        .unwrap_or_else(|error| error.exit())
+    {
+        cli::Suite::Smoke(image) => {
+            tracing::info!(image = %image, "starting smoke suite");
+            let results = suites::smoke::run(&image).await?;
+            suites::smoke::print_summary(&results);
+            if results.iter().any(|r| !r.passed) {
+                anyhow::bail!("Smoke suite failed");
+            }
+        }
+        cli::Suite::Protocol(config) => suites::protocol_p10_p11::run(config).await?,
     }
 
     Ok(())

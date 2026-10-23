@@ -1,5 +1,5 @@
-use crate::runner::Fixtures;
-use anyhow::{bail, Context};
+use super::super::Fixtures;
+use anyhow::{Context, bail};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
