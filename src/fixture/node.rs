@@ -92,6 +92,7 @@ get_peers_info = true
 get_node_info = true
 get_account_info = true
 get_token_info = true
+get_token_list = true
 get_consensus_info = true
 get_block_info = true
 get_block_item_status = true
@@ -142,7 +143,20 @@ send_block_item = true
         )]);
 
         // ── Create container ──────────────────────────────────────────────────
-        let options = CreateContainerOptionsBuilder::default().build();
+        // A known name permits cleanup even if Docker creates the container but
+        // the create response is lost or times out. The temp directory is unique per node.
+        let container_name = format!(
+            "concordium-e2e-{}",
+            temp_dir
+                .path()
+                .file_name()
+                .context("Node data directory has no name")?
+                .to_string_lossy()
+                .trim_start_matches('.')
+        );
+        let options = CreateContainerOptionsBuilder::default()
+            .name(&container_name)
+            .build();
         let env = {
             let mut env = vec![
                 format!("CONCORDIUM_NODE_DATA_DIR={CONTAINER_DATA_DIR}"),
@@ -193,10 +207,20 @@ send_block_item = true
             ..Default::default()
         };
 
-        let response = docker
+        let response = match docker
             .create_container(Some(options), container_config)
             .await
-            .context("Failed to create container")?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Err(cleanup_error) = remove_container(docker, &container_name).await {
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "Create container failed; cleanup of {container_name} also failed: {cleanup_error:#}"
+                    )));
+                }
+                return Err(anyhow::Error::new(error).context("Failed to create container"));
+            }
+        };
 
         let container_id = response.id;
 
@@ -240,7 +264,7 @@ send_block_item = true
             }
         };
 
-        tracing::info!(
+        tracing::debug!(
             container_id = %&container_id[..12],
             image = %config.image,
             grpc_endpoint = %endpoint.uri(),
@@ -267,7 +291,7 @@ send_block_item = true
 
     /// Stop and remove the node container and delete all temporary files.
     pub async fn stop(self, docker: &Docker) -> Result<()> {
-        tracing::info!(container_id = %&self.container_id[..12], "stopping node container");
+        tracing::debug!(container_id = %&self.container_id[..12], "stopping node container");
 
         let stop_opts = StopContainerOptionsBuilder::default()
             .t(10i32) // 10-second grace period before SIGKILL
@@ -313,6 +337,16 @@ send_block_item = true
     pub async fn replace_image(&mut self, docker: &Docker, image: &str) -> Result<()> {
         remove_container(docker, &self.container_id).await?;
         self.config.image = image.to_string();
+        // Retain a cleanup address even if replacement creation loses its response.
+        self.container_id = format!(
+            "concordium-e2e-{}",
+            self.temp_dir
+                .path()
+                .file_name()
+                .context("Node data directory has no name")?
+                .to_string_lossy()
+                .trim_start_matches('.')
+        );
         let (id, endpoint) = Self::create_container(docker, &self.config, &self.temp_dir).await?;
         self.container_id = id;
         self.endpoint = endpoint;
@@ -367,7 +401,7 @@ send_block_item = true
 
     /// Wait until `get_node_info` succeeds. Block production is not required.
     pub async fn wait_for_health(&mut self) -> Result<()> {
-        tracing::info!("waiting for node gRPC readiness...");
+        tracing::debug!("waiting for node gRPC readiness...");
         tokio::time::timeout(READINESS_TIMEOUT, async {
             loop {
                 let result = match self.connect().await {
@@ -380,7 +414,7 @@ send_block_item = true
                 };
                 match result {
                     Ok(()) => {
-                        tracing::info!("node gRPC API is reachable");
+                        tracing::debug!("node gRPC API is reachable");
                         return Ok(());
                     }
                     Err(e) => {
@@ -400,13 +434,13 @@ send_block_item = true
     }
 
     async fn wait_for_first_block(&mut self) -> Result<()> {
-        tracing::info!("waiting for first block...");
+        tracing::debug!("waiting for first block...");
         let mut client = self.connect().await?;
         tokio::time::timeout(READINESS_TIMEOUT, async {
             loop {
                 match client.get_consensus_info().await {
                     Ok(info) if info.best_block_height.height >= 1 => {
-                        tracing::info!(
+                        tracing::debug!(
                             height = info.best_block_height.height,
                             "first block produced"
                         );

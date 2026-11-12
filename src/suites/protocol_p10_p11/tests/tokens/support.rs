@@ -1,9 +1,7 @@
-//! Shared token fixtures and finalized evidence. Criteria retain exclusive ownership of their assets.
-use super::super::super::{
-    REJOIN_TIMEOUT, context::TestContext, operations, state::FinalizedBlock, wait,
-};
+//! Token scenario fixtures and evidence at exact finalized blocks.
+use super::super::super::{operations, registry::TestContext, state::FinalizedBlock};
 use crate::fixture::genesis::GenesisAccount;
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result};
 use concordium_rust_sdk::{
     base::protocol_level_tokens::TokenId,
     id::types::AccountAddress,
@@ -13,58 +11,20 @@ use concordium_rust_sdk::{
 };
 use std::collections::BTreeMap;
 
-pub(super) struct Owner {
-    pub(super) id: TokenId,
-    governor: GenesisAccount,
-}
-impl Owner {
-    pub(super) fn new(accounts: Vec<GenesisAccount>, id: &str) -> Result<Self> {
-        let [governor]: [GenesisAccount; 1] =
-            accounts.try_into().ok().context("Expected one account")?;
-        Ok(Self {
-            id: TokenId::try_from(id.to_string())?,
-            governor,
-        })
-    }
-    pub(super) async fn create(&self, context: &TestContext<'_>) -> Result<()> {
-        let governor = self.governor.address;
-        operations::create_token(
-            &mut context.client(0).await?,
-            context.governance(),
-            governor,
-            &self.id,
-        )
-        .await
-    }
-    pub(super) async fn mint(&self, context: &TestContext<'_>) -> Result<()> {
-        operations::mint(&mut context.client(0).await?, &self.governor, &self.id).await
-    }
-}
-
 pub(super) struct Fixture {
-    pub(super) owner: Owner,
-    recipient: GenesisAccount,
+    pub(super) id: TokenId,
+    pub(super) governor: GenesisAccount,
+    pub(super) recipient: GenesisAccount,
 }
 impl Fixture {
     pub(super) fn new(accounts: Vec<GenesisAccount>, id: &str) -> Result<Self> {
         let [governor, recipient]: [GenesisAccount; 2] =
             accounts.try_into().ok().context("Expected two accounts")?;
         Ok(Self {
-            owner: Owner {
-                id: TokenId::try_from(id.to_string())?,
-                governor,
-            },
+            id: TokenId::try_from(id.to_string())?,
+            governor,
             recipient,
         })
-    }
-    pub(super) async fn prepare(&self, context: &TestContext<'_>) -> Result<()> {
-        prepare_token(
-            context,
-            &self.owner.id,
-            &self.owner.governor,
-            &self.recipient,
-        )
-        .await
     }
     pub(super) async fn transfer(
         &self,
@@ -73,14 +33,9 @@ impl Fixture {
         p11: bool,
     ) -> Result<()> {
         let recipient = self.recipient.address;
-        let mut client = context.client(node).await?;
-        let block = operations::transfer_token(
-            &mut client,
-            &self.owner.governor,
-            recipient,
-            &self.owner.id,
-        )
-        .await?;
+        let mut client = context.validators[node].connect().await?;
+        let block =
+            operations::transfer_token(&mut client, &self.governor, recipient, &self.id).await?;
         if p11 {
             operations::require_p11(&mut client, block).await?;
         }
@@ -88,54 +43,22 @@ impl Fixture {
     }
 }
 
-/// Reuse operations, never another criterion's accounts or asset.
-pub(crate) async fn prepare_token(
-    context: &TestContext<'_>,
-    id: &TokenId,
-    governor: &GenesisAccount,
-    recipient: &GenesisAccount,
-) -> Result<()> {
-    let address = governor.address;
-    let recipient = recipient.address;
-    let mut new = context.client(0).await?;
-    operations::create_token(&mut new, context.governance(), address, id).await?;
-    operations::transfer_token(&mut context.client(1).await?, governor, recipient, id).await?;
-    Ok(())
-}
-
-pub(super) struct Configuration {
+pub(super) struct Snapshot {
     pub(super) block: FinalizedBlock,
     pub(super) token: TokenInfo,
+    pub(super) accounts: BTreeMap<AccountAddress, Option<TokenAccountState>>,
 }
-pub(super) async fn configuration(
-    context: &TestContext<'_>,
-    id: &TokenId,
-) -> Result<Configuration> {
-    let mut client = context.client(0).await?;
+pub(super) async fn capture(context: &TestContext<'_>, id: &TokenId) -> Result<Snapshot> {
+    let mut client = context.validators[0].connect().await?;
     let block = FinalizedBlock::capture(&mut client).await?;
     let token = client
         .get_token_info(id.clone(), block.hash)
         .await?
         .response;
-    Ok(Configuration { block, token })
-}
-
-pub(super) struct Snapshot {
-    configuration: Configuration,
-    accounts: BTreeMap<AccountAddress, Option<TokenAccountState>>,
-}
-pub(super) async fn capture(context: &TestContext<'_>, id: &TokenId) -> Result<Snapshot> {
-    let configuration = configuration(context, id).await?;
-    let mut client = context.client(0).await?;
-    let accounts = collect_accounts(
-        &mut client,
-        context.accounts(),
-        id,
-        configuration.block.hash,
-    )
-    .await?;
+    let accounts = collect_accounts(&mut client, context.accounts, id, block.hash).await?;
     Ok(Snapshot {
-        configuration,
+        block,
+        token,
         accounts,
     })
 }
@@ -166,7 +89,7 @@ pub(crate) fn project(tokens: Vec<AccountToken>, id: &TokenId) -> Option<TokenAc
 }
 
 /// Treat omitted coin information as explicit CCD information, without ignoring other fields.
-pub(super) fn token_equivalent(left: &TokenInfo, right: &TokenInfo) -> Result<bool> {
+pub(in super::super) fn token_equivalent(left: &TokenInfo, right: &TokenInfo) -> Result<bool> {
     let normalize = |token: &TokenInfo| -> Result<_> {
         let mut module = token.token_state.decode_module_state()?;
         if let Some(governor) = &mut module.governance_account {
@@ -183,74 +106,17 @@ pub(super) fn token_equivalent(left: &TokenInfo, right: &TokenInfo) -> Result<bo
         && normalize(left)? == normalize(right)?)
 }
 
-async fn compare(context: &TestContext<'_>, snapshot: &Snapshot, observer: bool) -> Result<()> {
-    let reference = &snapshot.configuration;
-    for node in context.node_indices(observer) {
-        let mut client = context.client(node).await?;
-        ensure!(
-            client
-                .get_block_info(reference.block.hash)
-                .await?
-                .response
-                .finalized,
-            "Node {node} has not finalized token evidence"
-        );
-        let token = client
-            .get_token_info(reference.token.token_id.clone(), reference.block.hash)
-            .await?
-            .response;
-        ensure!(
-            token_equivalent(&token, &reference.token)?,
-            "Node {node} disagrees on token configuration"
-        );
-        for (address, expected) in &snapshot.accounts {
-            let info = client
-                .get_account_info(&(*address).into(), reference.block.hash)
-                .await?
-                .response;
-            ensure!(
-                project(info.tokens, &reference.token.token_id).as_ref() == expected.as_ref(),
-                "Node {node} disagrees on token account {address}"
-            );
-        }
-    }
-    Ok(())
-}
-
-pub(super) async fn agreement(
-    context: &TestContext<'_>,
-    id: &TokenId,
-    reference: Option<&Snapshot>,
-    observer: bool,
-) -> Result<()> {
-    let current;
-    let snapshot = match reference {
-        Some(saved) => saved,
-        None => {
-            current = wait::bounded(
-                "capture token agreement evidence",
-                REJOIN_TIMEOUT,
-                capture(context, id),
-            )
-            .await?;
-            &current
-        }
-    };
-    wait::agreement(|| compare(context, snapshot, observer)).await
-}
-
 #[cfg(test)]
 mod unit_tests {
     #[test]
-    fn constructors_reject_wrong_account_counts() -> Result<()> {
-        assert!(Owner::new(Vec::new(), "E2E").is_err());
+    fn fixture_requires_exactly_two_accounts() -> Result<()> {
         assert!(Fixture::new(Vec::new(), "E2E").is_err());
         let mut genesis =
-            crate::fixture::genesis::GenesisFixture::four_validator_p10_with_accounts(2)?;
+            crate::fixture::genesis::GenesisFixture::four_validator_p10_with_accounts(3)?;
         let mut accounts = genesis.accounts.split_off(4);
-        let extra = accounts.split_off(1);
-        assert!(Fixture::new(accounts, "E2E").is_err());
-        assert!(Owner::new(extra, "E2E").is_ok());
+        let single = accounts.split_off(2);
+        assert!(Fixture::new(single, "E2E").is_err());
+        assert!(Fixture::new(accounts, "E2E").is_ok());
         Ok(())
     }
 

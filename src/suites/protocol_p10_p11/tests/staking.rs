@@ -1,9 +1,7 @@
-//! Independent delegation, staking-preservation and staking-agreement criteria.
-use super::super::registry::{ProtocolUpgradeTest, TestProgress, TestRegistry};
+//! Passive delegation and reward-aware staking preservation across the update.
+use super::super::registry::{ProtocolUpgradeTest, TestContext, TestProgress, TestRegistry};
 use super::super::{
-    REJOIN_TIMEOUT,
-    context::TestContext,
-    operations,
+    REJOIN_TIMEOUT, operations,
     state::{FinalizedBlock, rewards_between},
     wait,
 };
@@ -16,108 +14,60 @@ use concordium_rust_sdk::{
 };
 use std::collections::BTreeMap;
 
-/// Register independent delegation, preservation, and cross-node agreement criteria.
-pub(super) fn register(registry: &mut TestRegistry) -> Result<()> {
-    registry.register::<Delegation>()?;
-    registry.register::<Preservation>()?;
-    registry.register::<MixedAgreement>()?;
-    registry.register::<BeforeAgreement>()?;
-    registry.register::<AfterAgreement>()?;
-    registry.register::<OperationsAgreement>()?;
-    registry.register::<AllNodesAgreement>()
+pub(super) fn register(registry: &mut TestRegistry) {
+    registry
+        .group("Staking")
+        .register(StakingContinuity::default());
 }
 
-struct Fixture {
-    delegator: GenesisAccount,
-}
-impl Fixture {
-    /// Require one private account for this criterion's delegation setup.
-    fn new(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        let [delegator]: [GenesisAccount; 1] =
-            accounts.try_into().ok().context("Expected 1 account")?;
-        Ok(Self { delegator })
-    }
-    /// Finalize passive delegation through old software while node versions are mixed.
-    async fn prepare(&self, context: &TestContext<'_>) -> Result<()> {
-        operations::delegate(&mut context.client(1).await?, &self.delegator).await
-    }
-}
-
-struct Delegation(Fixture);
-impl ProtocolUpgradeTest for Delegation {
-    fn name() -> String {
-        "Passive delegation finalizes with rewards not restaked".into()
-    }
-    fn required_accounts() -> usize {
-        1
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts)?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
-        Ok(TestProgress::Passed)
-    }
-}
-
-struct Snapshot {
-    block: FinalizedBlock,
-    accounts: BTreeMap<AccountAddress, Option<AccountStakingInfo>>,
-}
-/// Preserve absent staking roles, but reject SDK variants this suite cannot interpret.
-fn known_staking_info(info: &AccountInfo) -> Result<Option<AccountStakingInfo>> {
-    info.account_stake
-        .as_ref()
-        .map(|stake| stake.as_known().context("Unknown staking state").cloned())
-        .transpose()
-}
-/// Read all tracked staking roles and settings at one finalized block on validator 0.
-async fn capture(context: &TestContext<'_>) -> Result<Snapshot> {
-    let mut client = context.client(0).await?;
-    let block = FinalizedBlock::capture(&mut client).await?;
-    let mut accounts = BTreeMap::new();
-    for address in context.accounts() {
-        let info = client
-            .get_account_info(&(*address).into(), block.hash)
-            .await?
-            .response;
-        accounts.insert(*address, known_staking_info(&info)?);
-    }
-    Ok(Snapshot { block, accounts })
-}
-struct Preservation {
-    fixture: Fixture,
+#[derive(Default)]
+struct StakingContinuity {
+    delegator: Option<GenesisAccount>,
     before: Option<Snapshot>,
 }
-impl ProtocolUpgradeTest for Preservation {
-    fn name() -> String {
-        "Staking configuration is preserved with only restakable reward deltas".into()
+
+#[async_trait::async_trait(?Send)]
+impl ProtocolUpgradeTest for StakingContinuity {
+    fn name(&self) -> String {
+        "Passive delegation and reward-aware staking preservation across P11".into()
     }
-    fn required_accounts() -> usize {
+    fn required_accounts(&self) -> usize {
         1
     }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self {
-            fixture: Fixture::new(accounts)?,
-            before: None,
-        })
+    async fn prepare_before_update(
+        &mut self,
+        _context: &TestContext<'_>,
+        accounts: Vec<GenesisAccount>,
+    ) -> Result<()> {
+        let [delegator]: [GenesisAccount; 1] =
+            accounts.try_into().ok().context("Expected 1 account")?;
+        self.delegator = Some(delegator);
+        Ok(())
     }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.fixture.prepare(context).await?;
+    async fn run_before_update(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
+        operations::delegate(
+            &mut context.validators[1].connect().await?,
+            self.delegator.as_ref().context("Delegator not prepared")?,
+        )
+        .await?;
         Ok(TestProgress::Pending)
     }
-    async fn on_before_activation(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.before = Some(
-            wait::bounded("capture staking baseline", REJOIN_TIMEOUT, capture(context)).await?,
-        );
+    async fn finish_before_update(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
+        let before =
+            wait::bounded("capture staking baseline", REJOIN_TIMEOUT, capture(context)).await?;
+        self.before = Some(before);
         Ok(TestProgress::Pending)
     }
-    async fn on_after_activation(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
+    async fn prepare_after_update(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
         wait::bounded("reward-aware staking preservation", REJOIN_TIMEOUT, async {
             let before = self.before.as_ref().context("No staking baseline")?;
             let after = capture(context).await?;
-            let rewards =
-                rewards_between(&mut context.client(0).await?, &before.block, &after.block).await?;
+            let rewards = rewards_between(
+                &mut context.validators[0].connect().await?,
+                &before.block,
+                &after.block,
+            )
+            .await?;
             ensure!(
                 before.accounts.keys().eq(after.accounts.keys()),
                 "Tracked staking accounts changed"
@@ -128,13 +78,42 @@ impl ProtocolUpgradeTest for Preservation {
                     .get(address)
                     .copied()
                     .unwrap_or(Amount::zero());
-                staking_preserved(old.as_ref(), after.accounts[address].as_ref(), reward)?;
+                staking_preserved(old.as_ref(), after.accounts[address].as_ref(), reward)
+                    .with_context(|| format!("Staking preservation for {address}"))?;
             }
             Ok(())
         })
         .await?;
         Ok(TestProgress::Passed)
     }
+}
+
+struct Snapshot {
+    block: FinalizedBlock,
+    accounts: BTreeMap<AccountAddress, Option<AccountStakingInfo>>,
+}
+
+/// Preserve absent staking roles, but reject SDK variants this suite cannot interpret.
+fn known_staking_info(info: &AccountInfo) -> Result<Option<AccountStakingInfo>> {
+    info.account_stake
+        .as_ref()
+        .map(|stake| stake.as_known().context("Unknown staking state").cloned())
+        .transpose()
+}
+
+/// Read all tracked staking roles and settings at one finalized block on validator 0.
+async fn capture(context: &TestContext<'_>) -> Result<Snapshot> {
+    let mut client = context.validators[0].connect().await?;
+    let block = FinalizedBlock::capture(&mut client).await?;
+    let mut accounts = BTreeMap::new();
+    for address in context.accounts {
+        let info = client
+            .get_account_info(&(*address).into(), block.hash)
+            .await?
+            .response;
+        accounts.insert(*address, known_staking_info(&info)?);
+    }
+    Ok(Snapshot { block, accounts })
 }
 
 /// Require unchanged roles and settings, allowing only restaked reward increases in stake.
@@ -156,199 +135,19 @@ fn staking_preserved(
             restake_earnings, ..
         } => *restake_earnings,
     };
-    let expected = old.staked_amount() + if restake { reward } else { Amount::zero() };
-    ensure!(new.staked_amount() == expected, "Unexpected stake delta");
-    let config = |stake: &AccountStakingInfo| -> Result<serde_json::Value> {
-        let mut value = serde_json::to_value(stake)?;
-        value
-            .as_object_mut()
-            .context("Staking configuration is not an object")?
-            .remove("stakedAmount");
-        Ok(value)
-    };
+    let expected_stake = old.staked_amount() + if restake { reward } else { Amount::zero() };
+    let mut expected = old.clone();
+    match &mut expected {
+        AccountStakingInfo::Baker { staked_amount, .. }
+        | AccountStakingInfo::Delegated { staked_amount, .. } => {
+            *staked_amount = expected_stake;
+        }
+    }
     ensure!(
-        config(new)? == config(old)?,
-        "Staking configuration changed across activation"
+        *new == expected,
+        "Staking configuration or stake changed across activation"
     );
     Ok(())
-}
-
-/// Compare validators against saved staking evidence at its exact finalized block.
-/// Include the observer only when requested.
-async fn compare(context: &TestContext<'_>, snapshot: &Snapshot, observer: bool) -> Result<()> {
-    for node in context.node_indices(observer) {
-        let mut client = context.client(node).await?;
-        ensure!(
-            client
-                .get_block_info(snapshot.block.hash)
-                .await?
-                .response
-                .finalized,
-            "Node {node} has not finalized staking evidence"
-        );
-        for (address, expected) in &snapshot.accounts {
-            let info = client
-                .get_account_info(&(*address).into(), snapshot.block.hash)
-                .await?
-                .response;
-            ensure!(
-                serde_json::to_value(known_staking_info(&info)?)?
-                    == serde_json::to_value(expected)?,
-                "Node {node} disagrees on staking account {address}"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Retry cross-node comparisons using saved evidence, or capture a baseline once if absent.
-async fn agreement(
-    context: &TestContext<'_>,
-    reference: Option<&Snapshot>,
-    observer: bool,
-) -> Result<()> {
-    let current;
-    let snapshot = match reference {
-        Some(saved) => saved,
-        None => {
-            current = wait::bounded(
-                "capture staking agreement evidence",
-                REJOIN_TIMEOUT,
-                capture(context),
-            )
-            .await?;
-            &current
-        }
-    };
-    wait::agreement(|| compare(context, snapshot, observer)).await
-}
-
-struct MixedAgreement(Fixture);
-impl ProtocolUpgradeTest for MixedAgreement {
-    fn name() -> String {
-        "Mixed-version nodes agree on finalized staking configuration".into()
-    }
-    fn required_accounts() -> usize {
-        1
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts)?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
-        agreement(context, None, true).await?;
-        Ok(TestProgress::Passed)
-    }
-}
-
-struct BeforeAgreement(Fixture);
-impl ProtocolUpgradeTest for BeforeAgreement {
-    fn name() -> String {
-        "All nodes agree on pre-update staking configuration".into()
-    }
-    fn required_accounts() -> usize {
-        1
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts)?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
-        Ok(TestProgress::Pending)
-    }
-    async fn on_before_activation(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        agreement(context, None, true).await?;
-        Ok(TestProgress::Passed)
-    }
-}
-
-struct AfterAgreement(Fixture);
-impl ProtocolUpgradeTest for AfterAgreement {
-    fn name() -> String {
-        "Validators agree on preserved staking configuration".into()
-    }
-    fn required_accounts() -> usize {
-        1
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts)?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
-        Ok(TestProgress::Pending)
-    }
-    async fn on_after_activation(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        agreement(context, None, false).await?;
-        Ok(TestProgress::Passed)
-    }
-}
-
-struct OperationsAgreement(Fixture);
-impl ProtocolUpgradeTest for OperationsAgreement {
-    fn name() -> String {
-        "Validators agree on finalized P11 staking configuration".into()
-    }
-    fn required_accounts() -> usize {
-        1
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts)?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
-        Ok(TestProgress::Pending)
-    }
-    async fn on_operations_complete(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        agreement(context, None, false).await?;
-        Ok(TestProgress::Passed)
-    }
-}
-
-struct AllNodesAgreement {
-    fixture: Fixture,
-    reference: Option<Snapshot>,
-}
-impl ProtocolUpgradeTest for AllNodesAgreement {
-    fn name() -> String {
-        "All five nodes agree on saved P11 staking configuration".into()
-    }
-    fn required_accounts() -> usize {
-        1
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self {
-            fixture: Fixture::new(accounts)?,
-            reference: None,
-        })
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.fixture.prepare(context).await?;
-        Ok(TestProgress::Pending)
-    }
-    async fn on_operations_complete(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.reference = Some(
-            wait::bounded(
-                "save staking recovery evidence",
-                REJOIN_TIMEOUT,
-                capture(context),
-            )
-            .await?,
-        );
-        Ok(TestProgress::Pending)
-    }
-    async fn on_all_nodes_ready(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        agreement(
-            context,
-            Some(
-                self.reference
-                    .as_ref()
-                    .context("No staking recovery evidence")?,
-            ),
-            true,
-        )
-        .await?;
-        Ok(TestProgress::Passed)
-    }
 }
 
 #[cfg(test)]
@@ -379,5 +178,17 @@ mod tests {
             staking_preserved(Some(&old), Some(&delegated(100, true)), Amount::zero()).is_err()
         );
         assert!(staking_preserved(Some(&old), None, Amount::zero()).is_err());
+        assert!(staking_preserved(None, Some(&old), Amount::zero()).is_err());
+        assert!(staking_preserved(None, None, Amount::zero()).is_ok());
+        let mut changed_target = old.clone();
+        if let AccountStakingInfo::Delegated {
+            delegation_target, ..
+        } = &mut changed_target
+        {
+            *delegation_target = DelegationTarget::Baker {
+                baker_id: concordium_rust_sdk::types::AccountIndex::from(0).into(),
+            };
+        }
+        assert!(staking_preserved(Some(&old), Some(&changed_target), Amount::zero()).is_err());
     }
 }

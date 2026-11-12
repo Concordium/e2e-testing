@@ -46,14 +46,8 @@ cargo run --release -- smoke --image NODE_IMAGE
 
 ### P10 → P11 continuity
 
-The suite starts a private P10 chain with four validators and an observer, then
-upgrades validators one at a time while checking that finalization and CCD
-transfers continue. During mixed-version operation, it prepares CCD, delegation
-and token state; after all validators are upgraded, it submits a governance
-update to activate P11 and checks that this state is preserved. It then runs fresh
-CCD and token transfers at P11, verifies that the old observer cannot follow the
-update, and upgrades the observer using its existing database. Finally, it checks
-that all five nodes agree on saved finalized state and cleans up the network.
+Checks rolling validator upgrades, preservation of CCD, staking, and token state
+across P11 activation, and database-preserving observer recovery.
 
 ```sh
 cargo run --release -- protocol-p10-p11 \
@@ -61,7 +55,7 @@ cargo run --release -- protocol-p10-p11 \
 ```
 
 See the [protocol suite documentation](docs/protocol-p10-p11.md) for image
-compatibility requirements.
+compatibility requirements, lifecycle checks, and instructions for adding tests.
 
 ### Available options
 

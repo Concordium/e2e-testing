@@ -44,7 +44,7 @@ async fn submit_receipt(
     label: &str,
 ) -> Result<(BlockHash, concordium_rust_sdk::types::BlockItemSummary)> {
     let hash = client.send_block_item(&item).await?;
-    tracing::info!(operation = label, transaction = %hash, "submitted transaction");
+    tracing::debug!(operation = label, transaction = %hash, "submitted transaction");
     let (block, summary) =
         tokio::time::timeout(TRANSACTION_TIMEOUT, client.wait_until_finalized(&hash))
             .await
@@ -58,7 +58,7 @@ async fn submit_receipt(
         summary.is_success().as_known() == Some(&true),
         "{label}: unsuccessful or unknown outcome: {summary:?}"
     );
-    tracing::info!(operation = label, transaction = %hash, block = %block, "transaction finalized successfully");
+    tracing::debug!(operation = label, transaction = %hash, block = %block, "transaction finalized successfully");
     Ok((block, summary))
 }
 

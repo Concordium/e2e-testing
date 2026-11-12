@@ -2,7 +2,7 @@
 use super::{POLL_INTERVAL, REJOIN_TIMEOUT};
 use crate::fixture::node::NodeFixture;
 use anyhow::{Context, Result};
-use concordium_rust_sdk::types::hashes::BlockHash;
+use concordium_rust_sdk::{types::hashes::BlockHash, v2::Client};
 use std::{future::Future, time::Duration};
 
 /// Apply a deadline to an operation. Include its label and time limit in timeout errors.
@@ -46,24 +46,21 @@ pub async fn block(node: &NodeFixture, target: BlockHash, protocol: u64) -> Resu
     result.with_context(|| format!("Last catch-up observation: {last}"))
 }
 
-/// Retry a test-owned comparison. Record only the final result outside this poll.
-pub async fn agreement<F, Work>(mut compare: F) -> Result<()>
-where
-    F: FnMut() -> Work,
-    Work: Future<Output = Result<()>>,
-{
-    let mut last_error = String::new();
-    let result = bounded("finalized state agreement", REJOIN_TIMEOUT, async {
+/// Wait for a saved block to finalize. Propagate errors other than a missing block.
+/// Compare immutable state only after this wait, without retrying mismatches.
+pub async fn finalized(client: &mut Client, target: BlockHash) -> Result<()> {
+    bounded("reference block finalization", REJOIN_TIMEOUT, async {
         loop {
-            match compare().await {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = format!("{error:#}"),
+            match client.get_block_info(target).await {
+                Ok(info) if info.response.finalized => return Ok(()),
+                Err(error) if !error.is_not_found() => return Err(error.into()),
+                _ => (),
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     })
-    .await;
-    result.with_context(|| format!("Last agreement observation: {last_error}"))
+    .await
+    .with_context(|| format!("Waiting for finalized block {target}"))
 }
 
 #[cfg(test)]

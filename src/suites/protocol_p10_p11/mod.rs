@@ -1,9 +1,7 @@
 //! Ordered P10 -> P11 network lifecycle with test-owned acceptance checks.
-mod context;
 mod operations;
 mod payload;
 mod registry;
-mod results;
 mod state;
 mod tests;
 mod wait;
@@ -16,17 +14,11 @@ use crate::fixture::{
 use anyhow::{Context, Result, ensure};
 use bollard::Docker;
 use concordium_rust_sdk::{
-    base::updates::UpdatePayload,
-    common::types::TransactionTime,
-    id::types::AccountAddress,
-    v2::{BlockIdentifier, Client},
+    base::updates::UpdatePayload, common::types::TransactionTime, id::types::AccountAddress,
+    v2::BlockIdentifier,
 };
-use context::{LifecycleReferences, TestContext};
-use registry::{RegistryWork, TestRegistry};
-use std::{
-    future::Future,
-    time::{Duration, Instant},
-};
+use registry::{CleanupContext, TestContext, TestRegistry, TestResult};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use wait::{block as wait_block, bounded};
 
@@ -37,479 +29,300 @@ const REJOIN_TIMEOUT: Duration = Duration::from_secs(90);
 /// Maximum wait for finalized P11 progress after the update is finalized.
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(180);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-
 /// Genesis accounts and nodes place the four validators first, in the same order.
 const VALIDATOR_COUNT: usize = 4;
-/// The observer follows the validators in the node list.
-const OBSERVER_INDEX: usize = VALIDATOR_COUNT;
 
 pub struct Config {
     pub old_image: String,
-    /// Replacement image. It must support P10 and P11.
+    /// Replacement image supporting both P10 and P11.
     pub new_image: String,
 }
 
-/// The core owns containers and lifecycle references, but no feature fixtures.
-struct Lifecycle {
-    docker: Docker,
-    tests: TestRegistry,
-    config: Config,
-    cancellation: CancellationToken,
-    genesis: Option<GenesisFixture>,
-    /// Validators occupy indices 0 to 3. The observer occupies index 4.
-    nodes: Vec<NodeFixture>,
-    tracked_accounts: Vec<AccountAddress>,
-    references: LifecycleReferences,
-}
-
-/// Stop after the first failure and print acceptance coverage after unconditional cleanup.
+/// Print acceptance coverage after unconditional cleanup on controlled exit.
+/// Clean up test-owned resources before validators. Panics/hard stops are not covered.
 pub async fn run(config: Config) -> Result<()> {
     let cancellation = CancellationToken::new();
-    let tests = tests::register(cancellation.clone())?;
-    run_registered(config, cancellation, tests).await
-}
-
-async fn run_registered(
-    config: Config,
-    cancellation: CancellationToken,
-    tests: TestRegistry,
-) -> Result<()> {
-    let docker = match Docker::connect_with_local_defaults() {
-        Ok(docker) => docker,
-        Err(error) => return tests.finish(Err(error.into()), Ok(()), Duration::ZERO),
-    };
-    let mut lifecycle = Lifecycle {
-        docker,
-        tests,
-        config,
-        cancellation: cancellation.clone(),
-        genesis: None,
-        nodes: Vec::new(),
-        tracked_accounts: Vec::new(),
-        references: LifecycleReferences::default(),
-    };
-    // Finish creation or replacement and register its container ID before observing shutdown.
-    let signal_task = tokio::spawn(async move {
-        super::shutdown_signal().await;
-        cancellation.cancel();
-    });
-    tokio::task::yield_now().await;
-    let started_run = Instant::now();
-    let outcome = lifecycle.execute().await;
-    let cleanup = nodes::stop(std::mem::take(&mut lifecycle.nodes), &lifecycle.docker).await;
-    signal_task.abort();
-    lifecycle
-        .tests
-        .finish(outcome, cleanup, started_run.elapsed())
-}
-
-/// Check cancellation between actions, never by dropping in-flight resource operations.
-async fn action(
-    name: &str,
-    cancellation: &CancellationToken,
-    operation: impl Future<Output = Result<()>>,
-) -> Result<()> {
-    let started = Instant::now();
-    tracing::info!(action = name, "starting protocol action");
-    let outcome = async {
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        operation.await?;
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        Ok(())
-    }
-    .await;
-    match &outcome {
-        Ok(()) => tracing::info!(
-            action = name,
-            elapsed_seconds = started.elapsed().as_secs_f64(),
-            "PASS"
-        ),
-        Err(error) => {
-            tracing::error!(action = name, elapsed_seconds = started.elapsed().as_secs_f64(), error = %format!("{error:#}"), "FAIL")
-        }
-    }
-    outcome.with_context(|| name.to_string())
-}
-
-impl Lifecycle {
-    async fn notify<F>(&mut self, notify: F) -> Result<()>
-    where
-        F: for<'a, 'net> FnOnce(&'a mut TestRegistry, &'a TestContext<'net>) -> RegistryWork<'a>,
-    {
-        let context = TestContext::new(
-            &self.nodes,
-            &self.docker,
-            &self.tracked_accounts,
-            &self.genesis.as_ref().context("No genesis")?.governance_keys,
-            &self.references,
-        );
-        notify(&mut self.tests, &context).await
-    }
-
-    /// Establish each network condition before directly notifying the test lifecycle methods.
-    async fn execute(&mut self) -> Result<()> {
-        let cancellation = self.cancellation.clone();
-        action("inspect images", &cancellation, async {
-            cancellation
-                .run_until_cancelled(self.preflight())
-                .await
-                .context("Termination signal received")?
-        })
-        .await?;
-        action("start network", &cancellation, self.start()).await?;
-        action(
-            "upgrade validator 0",
-            &cancellation,
-            self.upgrade_validator(0),
-        )
-        .await?;
-        action(
-            "prepare mixed-version P10 state",
-            &cancellation,
-            self.notify(TestRegistry::mixed_version),
-        )
-        .await?;
-        for validator in 1..VALIDATOR_COUNT {
-            action(
-                &format!("upgrade validator {validator}"),
-                &cancellation,
-                self.upgrade_validator(validator),
-            )
-            .await?;
-        }
-        action(
-            "capture pre-update state",
-            &cancellation,
-            self.notify(TestRegistry::before_activation),
-        )
-        .await?;
-        action("activate P11", &cancellation, async {
-            cancellation
-                .run_until_cancelled(self.activate())
-                .await
-                .context("Termination signal received")?
-        })
-        .await?;
-        action(
-            "verify preserved state",
-            &cancellation,
-            self.notify(TestRegistry::after_activation),
-        )
-        .await?;
-        action("exercise P11", &cancellation, async {
-            self.notify(TestRegistry::preservation_verified).await?;
-            self.references.p11_recovery_target = Some(
-                cancellation
-                    .run_until_cancelled(async {
-                        Ok::<_, anyhow::Error>(
-                            self.client(0)
-                                .await?
-                                .get_consensus_info()
-                                .await?
-                                .last_finalized_block,
-                        )
-                    })
-                    .await
-                    .context("Termination signal received")??,
-            );
-            self.notify(TestRegistry::operations_complete).await
-        })
-        .await?;
-        action(
-            "check old observer",
-            &cancellation,
-            self.notify(TestRegistry::before_observer_upgrade),
-        )
-        .await?;
-        action("recover observer", &cancellation, self.recover_observer()).await?;
-        action(
-            "verify all-node agreement",
-            &cancellation,
-            self.notify(TestRegistry::all_nodes_ready),
-        )
-        .await
-    }
-
-    async fn client(&self, index: usize) -> Result<Client> {
-        self.nodes[index].connect().await
-    }
-
-    /// Resolve and pin image identities before any containers start.
-    async fn preflight(&mut self) -> Result<()> {
-        let old = self
-            .docker
-            .inspect_image(&self.config.old_image)
-            .await
-            .context("Inspect old image (pull it first)")?;
-        let new = self
-            .docker
-            .inspect_image(&self.config.new_image)
-            .await
-            .context("Inspect new image (pull it first)")?;
-        ensure!(
-            old.id != new.id,
-            "Old/new references resolve to the same image"
-        );
-        tracing::info!(old_image = %self.config.old_image, old_id = ?old.id,
-            new_image = %self.config.new_image, new_id = ?new.id,
-            update_payload_sha256 = %payload::payload_hash()?, "resolved test images and update payload");
-        self.config.old_image = old.id.context("Old image has no identity")?;
-        self.config.new_image = new.id.context("New image has no identity")?;
-        Ok(())
-    }
-
-    /// Register each successful start before readiness checks or cancellation.
-    async fn start(&mut self) -> Result<()> {
-        let cancellation = self.cancellation.clone();
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        let mut genesis = GenesisFixture::four_validator_p10_with_accounts(u32::try_from(
-            self.tests.account_count(),
-        )?)?;
-        self.tracked_accounts.clear();
-        for account in &genesis.accounts {
-            self.tracked_accounts.push(account.address);
-        }
-        let private_accounts = genesis.accounts.split_off(VALIDATOR_COUNT);
-        self.tests.provision(private_accounts)?;
-        self.genesis = Some(genesis);
-        let genesis = self.genesis.as_ref().context("No genesis")?;
-        let bytes = concordium_rust_sdk::genesis::serialize_genesis(&genesis.genesis_data);
-        for credential_mutex in &genesis.validators {
-            ensure!(!cancellation.is_cancelled(), "Termination signal received");
-            let credentials = serde_json::to_vec(&*credential_mutex.lock().unwrap())?;
-            let node = NodeFixture::start(
-                &self.docker,
-                NodeConfig {
-                    image: self.config.old_image.clone(),
-                    genesis_bytes: bytes.clone(),
-                    validator_credentials: Some(credentials),
-                },
-            )
-            .await?;
-            self.nodes.push(node);
-            ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        }
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        let observer = NodeFixture::start(
-            &self.docker,
-            NodeConfig {
-                image: self.config.old_image.clone(),
-                genesis_bytes: bytes,
-                validator_credentials: None,
-            },
-        )
-        .await?;
-        self.nodes.push(observer);
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        // Peering must precede readiness checks to establish a quorum.
-        cancellation.run_until_cancelled(async {
-            for node in &mut self.nodes { node.wait_for_health().await?; }
-            nodes::connect_peers(&self.nodes, &self.docker).await?;
-            for node in &mut self.nodes { node.wait_until_ready().await?; }
-            for index in 0..self.nodes.len() {
-                let mut client = self.client(index).await?;
-                let consensus = client.get_consensus_info().await?;
-                ensure!(consensus.protocol_version.0 == 10, "Node {index} did not start at P10");
-                tracing::info!(node = index, version = %client.get_node_info().await?.version, protocol = 10, "node ready");
-            }
-            Ok(())
-        }).await.context("Termination signal received")?
-    }
-
-    /// Establish offline and rejoined conditions without exposing container mutation to tests.
-    async fn upgrade_validator(&mut self, index: usize) -> Result<()> {
-        let cancellation = self.cancellation.clone();
-        let survivor = if index == 0 { 1 } else { 0 };
-        let height = cancellation
-            .run_until_cancelled(async {
-                Ok::<_, anyhow::Error>(
-                    self.client(survivor)
-                        .await?
-                        .get_consensus_info()
-                        .await?
-                        .last_finalized_block_height,
-                )
-            })
-            .await
-            .context("Termination signal received")??;
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        self.nodes[index].pause(&self.docker).await?;
-        self.references.pre_stop_height = Some((index, height));
-        self.notify(|tests, context| tests.validator_offline(index, context))
-            .await?;
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        // Do not cancel replacement: the fixture must register its new container ID.
-        self.nodes[index]
-            .replace_image(&self.docker, &self.config.new_image)
-            .await?;
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        let target = cancellation.run_until_cancelled(async {
-            self.nodes[index].wait_for_health().await?;
-            nodes::connect_peers(&self.nodes, &self.docker).await?;
-            let target = self.client(survivor).await?.get_consensus_info().await?.last_finalized_block;
-            wait_block(&self.nodes[index], target, 10).await?;
-            let mut upgraded = self.nodes[index].connect().await?;
-            tracing::info!(node = index, version = %upgraded.get_node_info().await?.version, block = %target, "node upgraded and rejoined");
-            Ok::<_, anyhow::Error>(target)
-        }).await.context("Termination signal received")??;
-        self.references.rejoin_target = Some((index, target));
-        self.notify(|tests, context| tests.validator_rejoined(index, context))
-            .await
-    }
-
-    /// Submit the update and save finalized block references for separate acceptance checks.
-    async fn activate(&mut self) -> Result<()> {
-        let mut client = self.client(0).await?;
-        let block = client
-            .get_block_info(BlockIdentifier::LastFinal)
-            .await?
-            .response;
-        let effective =
-            TransactionTime::from_seconds(u64::try_from(block.block_slot_time.timestamp() + 30)?);
-        let sequence = client
-            .get_next_update_sequence_numbers(BlockIdentifier::LastFinal)
-            .await?
-            .response
-            .protocol;
-        tracing::info!(effective_time = effective.seconds, block = %block.block_hash, "scheduled protocol update");
-        self.references.update_submission_block = Some(
-            operations::governance(
-                &mut client,
-                &self.genesis.as_ref().context("No genesis")?.governance_keys,
-                sequence,
-                effective,
-                UpdatePayload::Protocol(payload::protocol_update()?),
-                "protocol-update",
-            )
-            .await?,
-        );
-        self.references.p11_activation_block = Some(bounded("P11 activation", ACTIVATION_TIMEOUT, async {
-            loop {
-                let block = client.get_block_info(BlockIdentifier::LastFinal).await?.response;
-                if block.finalized && block.protocol_version.0 == 11 && block.era_block_height.height > 0 {
-                    tracing::info!(block = %block.block_hash, height = block.block_height.height, "P11 activated");
-                    return Ok(block.block_hash);
-                }
-                let logs = self.nodes[0].recent_logs(&self.docker).await?;
-                ensure!(!logs.contains("unsupported protocol update"),
-                    "New image does not support the bundled P11 update (source revision {}); last finalized protocol {}, height {}", payload::SOURCE_REVISION, block.protocol_version.0, block.block_height.height);
-                tracing::debug!(protocol = block.protocol_version.0, height = block.block_height.height, "waiting for P11 activation");
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        }).await?);
-        Ok(())
-    }
-
-    /// Retain the observer database and establish recovery before notifying tests.
-    async fn recover_observer(&mut self) -> Result<()> {
-        let cancellation = self.cancellation.clone();
-        let running = cancellation
-            .run_until_cancelled(self.nodes[OBSERVER_INDEX].process_running(&self.docker))
-            .await
-            .context("Termination signal received")??;
-        if running {
-            self.nodes[OBSERVER_INDEX].pause(&self.docker).await?;
-        }
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        self.nodes[OBSERVER_INDEX]
-            .replace_image(&self.docker, &self.config.new_image)
-            .await?;
-        ensure!(!cancellation.is_cancelled(), "Termination signal received");
-        cancellation.run_until_cancelled(async {
-            self.nodes[OBSERVER_INDEX].wait_for_health().await?;
-            nodes::connect_peers(&self.nodes, &self.docker).await?;
-            wait_block(&self.nodes[OBSERVER_INDEX], self.references.p11_recovery_target.context("No P11 recovery target")?, 11).await?;
-            let mut observer = self.nodes[OBSERVER_INDEX].connect().await?;
-            tracing::info!(version = %observer.get_node_info().await?.version, protocol = observer.get_consensus_info().await?.protocol_version.0, "observer recovered");
-            Ok::<_, anyhow::Error>(())
-        }).await.context("Termination signal received")??;
-        self.notify(TestRegistry::observer_recovered).await
-    }
-}
-
-#[cfg(test)]
-mod unit_tests {
-    use super::*;
-    #[tokio::test]
-    async fn cancelled_upgrade_does_not_access_the_next_validator() -> Result<()> {
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let mut lifecycle = Lifecycle {
-            docker: Docker::connect_with_local_defaults()?,
-            tests: tests::register(cancellation.clone())?,
-            config: Config {
-                old_image: "old".into(),
-                new_image: "new".into(),
-            },
-            cancellation,
-            genesis: None,
-            nodes: Vec::new(),
-            tracked_accounts: Vec::new(),
-            references: LifecycleReferences::default(),
-        };
-        let error = lifecycle.upgrade_validator(1).await.unwrap_err();
-        assert!(error.to_string().contains("Termination signal"));
-        Ok(())
-    }
-    #[tokio::test]
-    async fn action_does_not_poll_work_after_cancellation() {
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let polled = std::cell::Cell::new(false);
-        let result = action("start network", &cancellation, async {
-            polled.set(true);
-            Ok(())
-        })
-        .await;
-        assert!(!polled.get());
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("start network"));
-        assert!(error.contains("Termination signal"));
-    }
-
-    #[tokio::test]
-    async fn action_finishes_resource_work_before_observing_cancellation() {
-        let cancellation = CancellationToken::new();
-        let registered = std::cell::Cell::new(false);
-        let result = action("replace validator 2", &cancellation, async {
+    let mut tests = tests::register(cancellation.clone());
+    // Bound individual Docker requests without dropping whole resource-changing hooks.
+    let docker = Docker::connect_with_local_defaults()?.with_timeout(Duration::from_secs(10));
+    let signal_task = {
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            super::shutdown_signal().await;
+            tracing::info!("Received request for termination");
             cancellation.cancel();
-            tokio::task::yield_now().await;
-            registered.set(true);
-            Ok(())
         })
-        .await;
-        assert!(registered.get());
-        assert!(format!("{:#}", result.unwrap_err()).contains("Termination signal"));
-    }
+    };
+    let started = Instant::now();
+    let mut validators = Vec::new();
+    let outcome = execute(&docker, config, &mut tests, &mut validators, &cancellation).await;
+    // Cleanup is outside the cancellation boundary and independent of test status.
+    tracing::info!("Run test 'cleanup' hooks");
+    let test_cleanup = tests.cleanup(&CleanupContext { docker: &docker }).await;
+    tracing::info!("Cleanup validators");
+    let validator_cleanup = nodes::stop(validators, &docker).await;
+    signal_task.abort();
+    let results = tests.finish();
+    let cleanup_errors: Vec<_> = [test_cleanup, validator_cleanup]
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| format!("{error:#}"))
+        .collect();
+    let cleanup = if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(cleanup_errors.join("; ")))
+    };
+    let passed =
+        outcome.is_ok() && cleanup.is_ok() && results.iter().all(|check| check.result.is_ok());
+    render(&outcome, &cleanup, started.elapsed(), &results, passed);
+    ensure!(passed, "P10 -> P11 suite failed; see results above");
+    Ok(())
+}
 
-    #[tokio::test]
-    async fn action_failure_preserves_context_and_stops_the_sequence() {
-        let cancellation = CancellationToken::new();
-        let later_action_ran = std::cell::Cell::new(false);
-        let outcome = async {
-            action("upgrade validator 2", &cancellation, async {
-                Err(anyhow::anyhow!("RPC disconnected").context("catch-up failed"))
-            })
-            .await?;
-            action("upgrade validator 3", &cancellation, async {
-                later_action_ran.set(true);
-                Ok(())
-            })
-            .await
-        }
-        .await;
-        let error = format!("{:#}", outcome.unwrap_err());
-        assert!(error.contains("upgrade validator 2: catch-up failed: RPC disconnected"));
-        assert!(!later_action_ran.get());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Docker and a new image supporting the bundled P11 update"]
-    async fn full_protocol_lifecycle() -> Result<()> {
-        run(Config {
-            old_image: std::env::var("CONCORDIUM_OLD_IMAGE")?,
-            new_image: std::env::var("CONCORDIUM_NEW_IMAGE")?,
-        })
+async fn execute(
+    docker: &Docker,
+    config: Config,
+    tests: &mut TestRegistry,
+    validators: &mut Vec<NodeFixture>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    // --- preflight: Resolve and pin image identities before any containers start. ---
+    // Check before awaited work, never by dropping an in-flight resource operation.
+    ensure!(!cancellation.is_cancelled(), "Termination requested");
+    let old_image = docker
+        .inspect_image(&config.old_image)
         .await
+        .context("Inspect old image (pull it first)")?
+        .id
+        .context("Old image has no identity")?;
+    let new_image = docker
+        .inspect_image(&config.new_image)
+        .await
+        .context("Inspect new image (pull it first)")?
+        .id
+        .context("New image has no identity")?;
+    ensure!(
+        old_image != new_image,
+        "Old/new references resolve to the same image"
+    );
+    tracing::debug!(old_image = %old_image, new_image = %new_image,
+        update_payload_sha256 = %payload::payload_hash()?, "Resolved test images and payload");
+    // --- start: Retain each successful start before readiness checks or cancellation. ---
+    tracing::info!("Generating genesis");
+    let mut genesis =
+        GenesisFixture::four_validator_p10_with_accounts(u32::try_from(tests.account_count())?)?;
+    let accounts: Vec<AccountAddress> = genesis
+        .accounts
+        .iter()
+        .map(|account| account.address)
+        .collect();
+    let test_accounts = genesis.accounts.split_off(VALIDATOR_COUNT);
+    let bytes = concordium_rust_sdk::genesis::serialize_genesis(&genesis.genesis_data);
+    let context = TestContext {
+        validators,
+        accounts: &accounts,
+        governance: &genesis.governance_keys,
+        docker,
+        genesis: &bytes,
+        old_image: &old_image,
+        new_image: &new_image,
+    };
+    tracing::info!("Startup validators");
+    for credentials in &genesis.validators {
+        ensure!(!cancellation.is_cancelled(), "Termination requested");
+        let validator_credentials = serde_json::to_vec(&*credentials.lock().unwrap())?;
+        let node = NodeFixture::start(
+            docker,
+            NodeConfig {
+                image: old_image.clone(),
+                genesis_bytes: bytes.clone(),
+                validator_credentials: Some(validator_credentials),
+            },
+        )
+        .await?;
+        // Retain ownership before readiness or cancellation checks.
+        context.validators.push(node);
     }
+    for node in context.validators.iter_mut() {
+        ensure!(!cancellation.is_cancelled(), "Termination requested");
+        node.wait_for_health().await?;
+    }
+    // Peering must precede block-production readiness checks to establish a quorum.
+    ensure!(!cancellation.is_cancelled(), "Termination requested");
+    nodes::connect_peers(context.validators, docker).await?;
+    for node in context.validators.iter_mut() {
+        ensure!(!cancellation.is_cancelled(), "Termination requested");
+        node.wait_until_ready().await?;
+    }
+    for node in context.validators.iter() {
+        ensure!(
+            node.connect()
+                .await?
+                .get_consensus_info()
+                .await?
+                .protocol_version
+                .0
+                == 10,
+            "Validator did not start at P10"
+        );
+    }
+    // Prepare tests against a ready P10 network before upgrading any validators.
+    tracing::info!("Run test 'prepare_before_update' hooks");
+    tests.prepare_before_update(&context, test_accounts).await?;
+    tracing::info!("Run test 'run_before_update' hooks");
+    tests
+        .run_test_hook(|test| test.run_before_update(&context))
+        .await?;
+    tracing::info!("Run test 'finish_before_update' hooks");
+    tests
+        .run_test_hook(|test| test.finish_before_update(&context))
+        .await?;
+
+    // --- rolling upgrade: Exercise continuity with each validator offline and rejoined. ---
+    for validator in 0..VALIDATOR_COUNT {
+        // Observe continuity through a different validator while this one is stopped.
+        let mut client = context.validators[if validator == 1 { 0 } else { 1 }]
+            .connect()
+            .await?;
+        context.validators[validator].pause(docker).await?;
+        let height = client
+            .get_consensus_info()
+            .await?
+            .last_finalized_block_height;
+        bounded(
+            "finalization during validator downtime",
+            REJOIN_TIMEOUT,
+            async {
+                loop {
+                    let observed = client.get_consensus_info().await?;
+                    if observed.last_finalized_block_height > height {
+                        return Ok(());
+                    }
+                    tracing::debug!(
+                        validator,
+                        height = observed.last_finalized_block_height.height,
+                        "waiting for offline continuity"
+                    );
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+            },
+        )
+        .await?;
+        ensure!(!cancellation.is_cancelled(), "Termination requested");
+        context.validators[validator]
+            .replace_image(docker, &new_image)
+            .await?;
+        context.validators[validator].wait_for_health().await?;
+        nodes::connect_peers(context.validators, docker).await?;
+        ensure!(!cancellation.is_cancelled(), "Termination requested");
+        let target = client.get_consensus_info().await?.last_finalized_block;
+        wait_block(&context.validators[validator], target, 10).await?;
+        tracing::debug!(validator, block = %target, "Upgraded validator recovered finalized pre-update target");
+    }
+    // --- activate P11: Submit the governance update and wait for finalized era progress. ---
+    let mut client = context.validators[0].connect().await?;
+    let block = client
+        .get_block_info(BlockIdentifier::LastFinal)
+        .await?
+        .response;
+    let effective =
+        TransactionTime::from_seconds(u64::try_from(block.block_slot_time.timestamp() + 30)?);
+    let sequence = client
+        .get_next_update_sequence_numbers(BlockIdentifier::LastFinal)
+        .await?
+        .response
+        .protocol;
+    ensure!(!cancellation.is_cancelled(), "Termination requested");
+    tracing::info!("Submitting P11 protocol update");
+    operations::governance(
+        &mut client,
+        &genesis.governance_keys,
+        sequence,
+        effective,
+        UpdatePayload::Protocol(payload::protocol_update()?),
+        "protocol-update",
+    )
+    .await?;
+    tracing::info!("Protocol update submission finalized, waiting for P11 progress");
+    ensure!(!cancellation.is_cancelled(), "Termination requested");
+    bounded("P11 activation", ACTIVATION_TIMEOUT, async {
+        loop {
+            let block = client
+                .get_block_info(BlockIdentifier::LastFinal)
+                .await?
+                .response;
+            if block.finalized
+                && block.protocol_version.0 == 11
+                && block.era_block_height.height > 0
+            {
+                return Ok(());
+            }
+            ensure!(
+                !context.validators[0]
+                    .recent_logs(docker)
+                    .await?
+                    .contains("unsupported protocol update"),
+                "New image does not support bundled P11 update ({})",
+                payload::SOURCE_REVISION
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await?;
+    // --- prepare after update: Verify preservation and prepare the next operations. ---
+    tracing::info!("Run test 'prepare_after_update' hooks");
+    tests
+        .run_test_hook(|test| test.prepare_after_update(&context))
+        .await?;
+    // --- run after update: Intended for fresh transactions after preservation checks. ---
+    tracing::info!("Run test 'run_after_update' hooks");
+    tests
+        .run_test_hook(|test| test.run_after_update(&context))
+        .await?;
+    // Every post-update operation finishes before final test-local verification.
+    tracing::info!("Run test 'finish_after_update' hooks");
+    tests
+        .run_test_hook(|test| test.finish_after_update(&context))
+        .await?;
+    Ok(())
+}
+
+fn render(
+    outcome: &Result<()>,
+    cleanup: &Result<()>,
+    elapsed: Duration,
+    results: &[TestResult],
+    passed: bool,
+) {
+    println!("P10 -> P11 acceptance results");
+    let mut previous_group = None;
+    for TestResult {
+        group,
+        name,
+        result,
+    } in results
+    {
+        if previous_group != Some(*group) {
+            println!("  {group}");
+            previous_group = Some(*group);
+        }
+        match result {
+            Ok(()) => println!("    [PASS] {name}"),
+            Err(error) => println!("    [FAIL] {name}: {error:#}"),
+        }
+    }
+    println!("  Suite lifecycle");
+    if let Err(error) = outcome {
+        println!("    [FAIL] execution: {error:#}");
+    }
+    match cleanup {
+        Ok(()) => println!("    [PASS] cleanup"),
+        Err(error) => println!("    [FAIL] cleanup: {error:#}"),
+    }
+    println!(
+        "  Result: {} ({:.1}s)\n",
+        if passed { "PASS" } else { "FAIL" },
+        elapsed.as_secs_f64()
+    );
 }

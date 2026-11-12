@@ -1,296 +1,167 @@
-//! Token acceptance criteria. Each criterion owns a distinct token fixture.
-mod support;
+//! Token creation, minting, transfers, and preservation across the update.
+pub(super) mod support;
 
 use super::super::{
-    REJOIN_TIMEOUT,
-    context::TestContext,
-    registry::{ProtocolUpgradeTest, TestProgress, TestRegistry},
+    REJOIN_TIMEOUT, operations,
+    registry::{ProtocolUpgradeTest, TestContext, TestProgress, TestRegistry},
     wait,
 };
-use super::token_accounts::TokenPreservation;
 use crate::fixture::genesis::GenesisAccount;
 use anyhow::{Context as _, Result, ensure};
-#[cfg(test)]
-pub(super) use support::project;
-use support::{
-    Configuration, Fixture, Owner, Snapshot, agreement, capture, configuration, token_equivalent,
+use concordium_rust_sdk::{
+    id::types::AccountAddress,
+    protocol_level_tokens::{TokenAccountState, TokenAmount},
 };
-pub(super) use support::{collect_accounts, prepare_token};
+use std::collections::BTreeMap;
+use support::{Fixture, Snapshot, capture, token_equivalent};
 
-pub(super) fn register(registry: &mut TestRegistry) -> Result<()> {
-    registry.register::<Creation>()?;
-    registry.register::<Minting>()?;
-    registry.register::<MixedTransfer>()?;
-    registry.register::<ConfigurationPreservation>()?;
-    registry.register::<TokenPreservation>()?;
-    registry.register::<FreshTransfer>()?;
-    registry.register::<MixedAgreement>()?;
-    registry.register::<BeforeAgreement>()?;
-    registry.register::<AfterAgreement>()?;
-    registry.register::<OperationsAgreement>()?;
-    registry.register::<AllNodesAgreement>()
+pub(super) fn register(registry: &mut TestRegistry) {
+    registry
+        .group("Tokens")
+        .register(TokenContinuity::default());
 }
 
-struct Creation(Owner);
-impl ProtocolUpgradeTest for Creation {
-    fn name() -> String {
-        "A token can be created through new software at P10".into()
-    }
-    fn required_accounts() -> usize {
-        1
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Owner::new(accounts, "E2E-CREATE")?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.create(context).await?;
-        Ok(TestProgress::Passed)
-    }
+#[derive(Default)]
+struct TokenContinuity {
+    fixture: Option<Fixture>,
+    before: Option<Snapshot>,
 }
 
-struct Minting(Owner);
-impl ProtocolUpgradeTest for Minting {
-    fn name() -> String {
-        "Minting increases the token supply".into()
+#[async_trait::async_trait(?Send)]
+impl ProtocolUpgradeTest for TokenContinuity {
+    fn name(&self) -> String {
+        "Token creation, minting, transfers, and preservation across P11".into()
     }
-    fn required_accounts() -> usize {
-        1
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Owner::new(accounts, "E2E-MINT")?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.create(context).await?;
-        self.0.mint(context).await?;
-        Ok(TestProgress::Passed)
-    }
-}
 
-struct MixedTransfer(Fixture);
-impl ProtocolUpgradeTest for MixedTransfer {
-    fn name() -> String {
-        "A token transfer through old software preserves supply and updates balances".into()
-    }
-    fn required_accounts() -> usize {
+    fn required_accounts(&self) -> usize {
         2
     }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts, "E2E-TRANSFER")?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.owner.create(context).await?;
-        self.0.transfer(context, 1, false).await?;
-        Ok(TestProgress::Passed)
-    }
-}
 
-struct FreshTransfer(Fixture);
-impl ProtocolUpgradeTest for FreshTransfer {
-    fn name() -> String {
-        "A fresh token transfer finalizes at P11".into()
-    }
-    fn required_accounts() -> usize {
-        2
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts, "E2E-P11")?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
-        Ok(TestProgress::Pending)
-    }
-    async fn on_preservation_verified(
+    async fn prepare_before_update(
         &mut self,
-        context: &TestContext<'_>,
-    ) -> Result<TestProgress> {
-        self.0.transfer(context, 0, true).await?;
-        Ok(TestProgress::Passed)
+        _context: &TestContext<'_>,
+        accounts: Vec<GenesisAccount>,
+    ) -> Result<()> {
+        self.fixture = Some(Fixture::new(accounts, "E2E-CONTINUITY")?);
+        Ok(())
     }
-}
 
-struct ConfigurationPreservation {
-    fixture: Fixture,
-    before: Option<Configuration>,
-}
-impl ProtocolUpgradeTest for ConfigurationPreservation {
-    fn name() -> String {
-        "Token configuration and supply survive activation".into()
-    }
-    fn required_accounts() -> usize {
-        2
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self {
-            fixture: Fixture::new(accounts, "E2E-CONFIG")?,
-            before: None,
-        })
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.fixture.prepare(context).await?;
+    async fn run_before_update(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
+        let fixture = self
+            .fixture
+            .as_ref()
+            .context("Token fixture not prepared")?;
+        let mut client = context.validators[0].connect().await?;
+        operations::create_token(
+            &mut client,
+            context.governance,
+            fixture.governor.address,
+            &fixture.id,
+        )
+        .await?;
+        operations::mint(&mut client, &fixture.governor, &fixture.id).await?;
+        fixture.transfer(context, 1, false).await?;
         Ok(TestProgress::Pending)
     }
-    async fn on_before_activation(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.before = Some(
-            wait::bounded(
-                "capture token configuration baseline",
-                REJOIN_TIMEOUT,
-                configuration(context, &self.fixture.owner.id),
-            )
-            .await?,
-        );
-        Ok(TestProgress::Pending)
-    }
-    async fn on_after_activation(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        wait::bounded(
-            "verify token configuration preservation",
+
+    async fn finish_before_update(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
+        let fixture = self
+            .fixture
+            .as_ref()
+            .context("Token fixture not prepared")?;
+        let before = wait::bounded(
+            "capture token baseline",
             REJOIN_TIMEOUT,
-            async {
-                let before = self
-                    .before
-                    .as_ref()
-                    .context("No token configuration baseline")?;
-                let after = configuration(context, &self.fixture.owner.id).await?;
-                ensure!(
-                    after.block.height >= before.block.height,
-                    "Finalized height regressed"
-                );
-                ensure!(
-                    token_equivalent(&before.token, &after.token)?,
-                    "Token configuration or supply changed across activation"
-                );
-                Ok(())
-            },
+            capture(context, &fixture.id),
         )
         .await?;
-        Ok(TestProgress::Passed)
-    }
-}
-
-struct MixedAgreement(Fixture);
-impl ProtocolUpgradeTest for MixedAgreement {
-    fn name() -> String {
-        "Mixed-version nodes agree on finalized token configuration and balances".into()
-    }
-    fn required_accounts() -> usize {
-        2
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts, "E2E-AGREE-MIXED")?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
-        agreement(context, &self.0.owner.id, None, true).await?;
-        Ok(TestProgress::Passed)
-    }
-}
-
-struct BeforeAgreement(Fixture);
-impl ProtocolUpgradeTest for BeforeAgreement {
-    fn name() -> String {
-        "All nodes agree on pre-update token configuration and balances".into()
-    }
-    fn required_accounts() -> usize {
-        2
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts, "E2E-AGREE-BEFORE")?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
+        ensure!(
+            balance(&before.accounts, &fixture.governor.address)? == TokenAmount::from_raw(1090, 0),
+            "Governor preparation balance is incorrect"
+        );
+        ensure!(
+            balance(&before.accounts, &fixture.recipient.address)? == TokenAmount::from_raw(10, 0),
+            "Recipient preparation balance is incorrect"
+        );
+        self.before = Some(before);
         Ok(TestProgress::Pending)
     }
-    async fn on_before_activation(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        agreement(context, &self.0.owner.id, None, true).await?;
-        Ok(TestProgress::Passed)
-    }
-}
 
-struct AfterAgreement(Fixture);
-impl ProtocolUpgradeTest for AfterAgreement {
-    fn name() -> String {
-        "Validators agree on preserved token configuration and balances".into()
-    }
-    fn required_accounts() -> usize {
-        2
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts, "E2E-AGREE-AFTER")?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
-        Ok(TestProgress::Pending)
-    }
-    async fn on_after_activation(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        agreement(context, &self.0.owner.id, None, false).await?;
-        Ok(TestProgress::Passed)
-    }
-}
-
-struct OperationsAgreement(Fixture);
-impl ProtocolUpgradeTest for OperationsAgreement {
-    fn name() -> String {
-        "Validators agree on finalized P11 token configuration and balances".into()
-    }
-    fn required_accounts() -> usize {
-        2
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self(Fixture::new(accounts, "E2E-AGREE-OPS")?))
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.0.prepare(context).await?;
-        Ok(TestProgress::Pending)
-    }
-    async fn on_operations_complete(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        agreement(context, &self.0.owner.id, None, false).await?;
-        Ok(TestProgress::Passed)
-    }
-}
-
-struct AllNodesAgreement {
-    fixture: Fixture,
-    reference: Option<Snapshot>,
-}
-impl ProtocolUpgradeTest for AllNodesAgreement {
-    fn name() -> String {
-        "All five nodes agree on saved P11 token configuration and balances".into()
-    }
-    fn required_accounts() -> usize {
-        2
-    }
-    fn setup(accounts: Vec<GenesisAccount>) -> Result<Self> {
-        Ok(Self {
-            fixture: Fixture::new(accounts, "E2E-AGREE-ALL")?,
-            reference: None,
-        })
-    }
-    async fn on_mixed_version(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.fixture.prepare(context).await?;
-        Ok(TestProgress::Pending)
-    }
-    async fn on_operations_complete(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        self.reference = Some(
-            wait::bounded(
-                "save token recovery evidence",
-                REJOIN_TIMEOUT,
-                capture(context, &self.fixture.owner.id),
-            )
-            .await?,
+    async fn prepare_after_update(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
+        let fixture = self
+            .fixture
+            .as_ref()
+            .context("Token fixture not prepared")?;
+        let before = self.before.as_ref().context("No token baseline")?;
+        let after = wait::bounded(
+            "capture preserved token state",
+            REJOIN_TIMEOUT,
+            capture(context, &fixture.id),
+        )
+        .await?;
+        ensure!(
+            after.block.height >= before.block.height,
+            "Finalized height regressed"
+        );
+        ensure!(
+            token_equivalent(&before.token, &after.token)?,
+            "Token configuration or supply changed across activation"
+        );
+        ensure!(
+            before.accounts == after.accounts,
+            "Token account balances or module state changed across activation"
         );
         Ok(TestProgress::Pending)
     }
-    async fn on_all_nodes_ready(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
-        agreement(
-            context,
-            &self.fixture.owner.id,
-            Some(
-                self.reference
-                    .as_ref()
-                    .context("No token recovery evidence")?,
-            ),
-            true,
-        )
-        .await?;
+
+    async fn run_after_update(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
+        self.fixture
+            .as_ref()
+            .context("Token fixture not prepared")?
+            .transfer(context, 0, true)
+            .await?;
         Ok(TestProgress::Passed)
+    }
+}
+
+fn balance(
+    accounts: &BTreeMap<AccountAddress, Option<TokenAccountState>>,
+    address: &AccountAddress,
+) -> Result<TokenAmount> {
+    Ok(accounts
+        .get(address)
+        .and_then(Option::as_ref)
+        .context("Prepared account has no token state")?
+        .balance)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use concordium_rust_sdk::protocol_level_tokens::{AccountToken, TokenId};
+
+    #[test]
+    fn evidence_ignores_another_tests_token() -> Result<()> {
+        let id = TokenId::try_from("E2E-ACCOUNTS".to_string())?;
+        let token = |id: TokenId, amount| AccountToken {
+            token_id: id,
+            state: TokenAccountState {
+                balance: TokenAmount::from_raw(amount, 0),
+                module_state: None,
+            },
+        };
+        let other = TokenId::try_from("E2E".to_string())?;
+        let own = token(id.clone(), 10);
+        let before = support::project(vec![token(other.clone(), 100), own.clone()], &id);
+        let after = support::project(vec![token(other.clone(), 900), own.clone()], &id);
+        assert_eq!(before, after);
+        assert_eq!(before, Some(own.state));
+        assert!(support::project(vec![token(other, 100)], &id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn baseline_requires_real_holder_state() {
+        assert!(balance(&BTreeMap::new(), &AccountAddress([1; 32])).is_err());
     }
 }

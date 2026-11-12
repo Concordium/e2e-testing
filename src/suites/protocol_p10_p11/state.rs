@@ -23,7 +23,7 @@ impl FinalizedBlock {
         let hash = client.get_consensus_info().await?.last_finalized_block;
         let info = client.get_block_info(hash).await?.response;
         ensure!(info.finalized, "Reference block is not finalized");
-        tracing::info!(block = %hash, height = info.block_height.height, state_hash = %info.block_state_hash, "captured finalized block reference");
+        tracing::debug!(block = %hash, height = info.block_height.height, state_hash = %info.block_state_hash, "captured finalized block reference");
         Ok(Self {
             hash,
             height: info.block_height,
