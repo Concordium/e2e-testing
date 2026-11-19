@@ -1,6 +1,6 @@
 //! End-to-end tests run sequentially against the live private chain.
 
-use crate::runner::Test;
+use super::Test;
 
 mod accounts;
 mod finalisation;

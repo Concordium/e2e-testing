@@ -1,48 +1,35 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod cli;
 mod fixture;
-mod runner;
-mod tests;
-
-/// Automated end-to-end test suite for the Concordium node.
-///
-/// Spins up a fresh private single-validator chain, runs the test suite
-/// against it, then tears the chain down — regardless of outcome.
-#[derive(Debug, Parser)]
-#[command(name = "concordium-e2e", version, about, long_about = None)]
-struct Args {
-    /// Docker image for the Concordium node under test
-    /// (e.g. `concordium-node:7.0.4`).
-    ///
-    /// May also be supplied via the CONCORDIUM_NODE_IMAGE environment variable.
-    #[arg(long, env = "CONCORDIUM_NODE_IMAGE", value_name = "IMAGE")]
-    image: String,
-
-    /// Run only tests whose names contain FILTER (case-insensitive substring match).
-    #[arg(long, value_name = "FILTER")]
-    filter: Option<String>,
-}
+mod suites;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,concordium_e2e=info")),
         )
         .init();
 
-    let args = Args::parse();
-
-    tracing::info!(image = %args.image, "starting e2e suite");
-
-    let results = runner::run(&args.image, args.filter.as_deref()).await?;
-
-    runner::print_summary(&results);
-
-    if results.iter().any(|r| !r.passed) {
-        std::process::exit(1);
+    match cli::Cli::parse() {
+        cli::Cli::Smoke(args) => {
+            tracing::info!(image = %args.image, "starting smoke suite");
+            let results = suites::smoke::run(&args.image).await?;
+            suites::smoke::print_summary(&results);
+            if results.iter().any(|r| !r.passed) {
+                anyhow::bail!("Smoke suite failed");
+            }
+        }
+        cli::Cli::ProtocolP10P11(args) => {
+            suites::protocol_p10_p11::run(suites::protocol_p10_p11::Config {
+                old_image: args.old_image,
+                new_image: args.new_image,
+            })
+            .await?;
+        }
     }
 
     Ok(())
