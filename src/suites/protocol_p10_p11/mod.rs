@@ -172,11 +172,11 @@ async fn execute(
     tests.prepare_before_update(&context, test_accounts).await?;
     tracing::info!("Run test 'run_before_update' hooks");
     tests
-        .run_test_hook(|test| test.run_before_update(&context))
+        .run_test_hook(&|test| test.run_before_update(&context))
         .await?;
     tracing::info!("Run test 'finish_before_update' hooks");
     tests
-        .run_test_hook(|test| test.finish_before_update(&context))
+        .run_test_hook(&|test| test.finish_before_update(&context))
         .await?;
 
     // --- rolling upgrade: Exercise continuity with each validator offline and rejoined. ---
@@ -273,17 +273,17 @@ async fn execute(
     // --- prepare after update: Verify preservation and prepare the next operations. ---
     tracing::info!("Run test 'prepare_after_update' hooks");
     tests
-        .run_test_hook(|test| test.prepare_after_update(&context))
+        .run_test_hook(&|test| test.prepare_after_update(&context))
         .await?;
     // --- run after update: Intended for fresh transactions after preservation checks. ---
     tracing::info!("Run test 'run_after_update' hooks");
     tests
-        .run_test_hook(|test| test.run_after_update(&context))
+        .run_test_hook(&|test| test.run_after_update(&context))
         .await?;
     // Every post-update operation finishes before final test-local verification.
     tracing::info!("Run test 'finish_after_update' hooks");
     tests
-        .run_test_hook(|test| test.finish_after_update(&context))
+        .run_test_hook(&|test| test.finish_after_update(&context))
         .await?;
     Ok(())
 }

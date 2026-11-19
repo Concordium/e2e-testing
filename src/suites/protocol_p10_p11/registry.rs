@@ -4,6 +4,7 @@ use crate::fixture::{genesis::GenesisAccount, node::NodeFixture};
 use anyhow::{Result, ensure};
 use bollard::Docker;
 use concordium_rust_sdk::{genesis::output::GeneratedKeyPair, id::types::AccountAddress};
+use futures_util::future::try_join_all;
 use std::{future::Future, pin::Pin};
 use tokio_util::sync::CancellationToken;
 
@@ -226,24 +227,30 @@ impl TestRegistry {
     /// collection of errors are returned.
     pub async fn run_test_hook<'a>(
         &'a mut self,
-        hook: impl Fn(&'a mut dyn ProtocolUpgradeTest) -> HookWork<'a>,
+        hook: &impl Fn(&'a mut dyn ProtocolUpgradeTest) -> HookWork<'a>,
     ) -> Result<()> {
-        let mut errors = Vec::new();
-        for registered in self.tests.iter_mut() {
-            if !matches!(registered.state, TestState::Running) {
-                continue;
-            }
-            ensure!(!self.cancellation.is_cancelled(), "Termination requested");
-            let name = registered.test.name();
-            registered.state = match hook(registered.test.as_mut()).await {
-                Ok(TestProgress::Passed) => TestState::Complete,
-                Ok(TestProgress::Pending) => TestState::Running,
-                Err(err) => {
-                    errors.push(format!("{name}: {err:#}"));
-                    TestState::Failed(err)
+        let result = try_join_all(self.tests.iter_mut().map(|registered| {
+            let cancellation = self.cancellation.clone();
+            async move {
+                if !matches!(registered.state, TestState::Running) {
+                    return Ok(None);
                 }
-            };
-        }
+                ensure!(!cancellation.is_cancelled(), "Termination requested");
+                let name = registered.test.name();
+                registered.state = match hook(registered.test.as_mut()).await {
+                    Ok(TestProgress::Passed) => TestState::Complete,
+                    Ok(TestProgress::Pending) => TestState::Running,
+                    Err(err) => TestState::Failed(err),
+                };
+                if let TestState::Failed(err) = &registered.state {
+                    Ok(Some(format!("{name}: {err}")))
+                } else {
+                    Ok(None)
+                }
+            }
+        }))
+        .await?;
+        let errors: Vec<_> = result.into_iter().flatten().collect();
         ensure!(
             errors.is_empty(),
             "Test phase failed: {}",
@@ -447,10 +454,10 @@ mod tests {
         // Mirror the runner's `?` barrier between phases.
         let outcome: Result<()> = async {
             registry
-                .run_test_hook(|test| test.run_before_update(&context))
+                .run_test_hook(&|test| test.run_before_update(&context))
                 .await?;
             registry
-                .run_test_hook(|test| test.run_after_update(&context))
+                .run_test_hook(&|test| test.run_after_update(&context))
                 .await
         }
         .await;
@@ -483,10 +490,10 @@ mod tests {
         let context = fixtures.context();
         registry.prepare_before_update(&context, Vec::new()).await?;
         registry
-            .run_test_hook(|test| test.run_before_update(&context))
+            .run_test_hook(&|test| test.run_before_update(&context))
             .await?;
         registry
-            .run_test_hook(|test| test.run_after_update(&context))
+            .run_test_hook(&|test| test.run_after_update(&context))
             .await?;
         registry
             .cleanup(&CleanupContext {
@@ -525,7 +532,7 @@ mod tests {
         registry.prepare_before_update(&context, Vec::new()).await?;
         assert!(
             registry
-                .run_test_hook(|test| test.run_before_update(&context))
+                .run_test_hook(&|test| test.run_before_update(&context))
                 .await
                 .is_err()
         );
@@ -589,7 +596,7 @@ mod tests {
         let context = fixtures.context();
         registry.prepare_before_update(&context, Vec::new()).await?;
         registry
-            .run_test_hook(|test| test.run_before_update(&context))
+            .run_test_hook(&|test| test.run_before_update(&context))
             .await?;
         assert!(registry.finish()[0].result.is_ok());
         Ok(())
