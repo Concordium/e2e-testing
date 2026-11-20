@@ -7,10 +7,18 @@ use concordium_rust_sdk::{
 };
 use std::time::Duration;
 
+pub(super) fn tests() -> Vec<super::Test> {
+    vec![super::Test {
+        group: "CCD transfers",
+        name: "Transfer is finalized",
+        run: Box::new(|fixtures| Box::pin(ccd_transfer_is_finalised(fixtures))),
+    }]
+}
+
 const TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSFER_AMOUNT: Amount = Amount::from_micro_ccd(1_000_000);
 
-pub async fn ccd_transfer_is_finalised(fixtures: &Fixtures) -> anyhow::Result<()> {
+async fn ccd_transfer_is_finalised(fixtures: &Fixtures) -> anyhow::Result<()> {
     let sender = &fixtures.genesis.accounts[1];
     let recipient_address = fixtures.genesis.accounts[0].address;
 

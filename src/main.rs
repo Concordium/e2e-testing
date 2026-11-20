@@ -16,19 +16,22 @@ async fn main() -> Result<()> {
 
     match cli::Cli::parse() {
         cli::Cli::Smoke(args) => {
-            tracing::info!(image = %args.image, "starting smoke suite");
-            let results = suites::smoke::run(&args.image).await?;
-            suites::smoke::print_summary(&results);
-            if results.iter().any(|r| !r.passed) {
+            let report = suites::smoke::run(&args.image, args.protocol).await?;
+            print!("{report}");
+            if !report.is_passed() {
                 anyhow::bail!("Smoke suite failed");
             }
         }
         cli::Cli::ProtocolP10P11(args) => {
-            suites::protocol_p10_p11::run(suites::protocol_p10_p11::Config {
+            let report = suites::protocol_p10_p11::run(suites::protocol_p10_p11::Config {
                 old_image: args.old_image,
                 new_image: args.new_image,
             })
             .await?;
+            print!("{report}");
+            if !report.is_passed() {
+                anyhow::bail!("P10 -> P11 suite failed");
+            }
         }
     }
 

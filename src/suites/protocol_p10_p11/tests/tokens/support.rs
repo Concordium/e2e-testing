@@ -1,5 +1,5 @@
 //! Token scenario fixtures and evidence at exact finalized blocks.
-use super::super::super::{operations, registry::TestContext, state::FinalizedBlock};
+use super::super::super::{operations, registry::TestContext, state::FinalizedBlock, wait};
 use crate::fixture::genesis::GenesisAccount;
 use anyhow::{Context as _, Result};
 use concordium_rust_sdk::{
@@ -39,6 +39,8 @@ impl Fixture {
         if p11 {
             operations::require_p11(&mut client, block).await?;
         }
+        let mut baseline_client = context.validators[0].connect().await?;
+        wait::finalized(&mut baseline_client, block).await?;
         Ok(())
     }
 }

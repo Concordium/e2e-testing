@@ -4,12 +4,13 @@
 //! 1. Generate a fresh genesis block via [`crate::fixture::genesis`].
 //! 2. Start a node container via [`crate::fixture::node`].
 //! 3. Wait for the node to become ready (healthy + first block).
-//! 4. Run each registered test in order, collecting results.
+//! 4. Run registered tests concurrently, retaining results in registration order.
 //! 5. Stop the container and delete temp files — always, even on failure.
 //! 6. Return results to `main` for summary and exit code.
 
 mod tests;
 
+use super::report::{Check, Outcome, SuiteReport};
 use super::shutdown_signal;
 use crate::fixture::{
     genesis::GenesisFixture,
@@ -17,25 +18,18 @@ use crate::fixture::{
 };
 use anyhow::{Context, Result};
 use bollard::Docker;
-
-/// The result of a single test case.
-#[derive(Debug)]
-pub struct TestResult {
-    /// Human-readable test name.
-    pub name: String,
-    /// `true` if the test passed.
-    pub passed: bool,
-    /// Optional failure message.
-    pub message: Option<String>,
-}
+use concordium_rust_sdk::types::{ProtocolVersion, queries::ProtocolVersionInt};
+use std::time::Instant;
 
 use std::{future::Future, pin::Pin};
 
 /// A test operation that can borrow the suite fixtures.
 pub type TestFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 
-/// One named smoke check. The runner records its result before the next check.
+/// One named smoke check, run concurrently with the other registered checks.
 pub struct Test {
+    /// Feature area used as the report heading.
+    pub group: &'static str,
     /// Name used in logs and the result summary.
     pub name: &'static str,
     /// Run this check against the suite's shared chain.
@@ -53,11 +47,17 @@ pub struct Fixtures {
 /// Run the full test suite against the given node image.
 ///
 /// Always stops the node container before returning, regardless of outcome.
-pub async fn run(image: &str) -> Result<Vec<TestResult>> {
-    // ── Connect to Docker daemon ──────────────────────────────────────────
-    let docker =
-        Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
-
+pub async fn run(image: &str, protocol: ProtocolVersion) -> Result<SuiteReport> {
+    let started = Instant::now();
+    let tests = tests::all_tests();
+    let mut checks: Vec<Check> = tests
+        .iter()
+        .map(|test| Check {
+            group: test.group.into(),
+            name: test.name.into(),
+            outcome: Outcome::NotRun,
+        })
+        .collect();
     // Install signal handlers before creating any Docker resources. A signal
     // received during startup is retained until the container can be cleaned up.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -70,10 +70,13 @@ pub async fn run(image: &str) -> Result<Vec<TestResult>> {
     });
     tokio::task::yield_now().await;
 
-    // ── Step 1: Generate genesis ──────────────────────────────────────────────
+    let docker =
+        Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
+
+    // ── Step 1: Generate genesis ──────────────────────────────────────────
     tracing::info!("generating genesis block...");
-    let genesis = GenesisFixture::single_validator_p10()?;
-    tracing::info!(
+    let genesis = GenesisFixture::single_validator(protocol)?;
+    tracing::debug!(
         validators = genesis.validators.len(),
         accounts = genesis.accounts.len(),
         "genesis block generated"
@@ -103,18 +106,33 @@ pub async fn run(image: &str) -> Result<Vec<TestResult>> {
 
     // ── Step 3: Wait for readiness (health + block) ───────────────────────────
     let readiness_result = tokio::select! {
-        result = node.wait_until_ready() => result,
+        result = async {
+            node.wait_until_ready().await?;
+            let actual = node
+                .connect()
+                .await?
+                .get_consensus_info()
+                .await?
+                .protocol_version;
+            anyhow::ensure!(
+                actual == ProtocolVersionInt::from_enum(protocol),
+                "Expected {protocol}, node reports {actual}"
+            );
+            Ok::<_, anyhow::Error>(())
+        } => result,
         _ = &mut shutdown => {
-            node.log_output(&docker).await;
-            let _ = node.stop(&docker).await;
-            anyhow::bail!("received termination signal during node startup");
+            Err(anyhow::anyhow!("Received termination signal during node startup"))
         }
     };
     if let Err(error) = readiness_result {
         tracing::error!("node did not become ready: {error}");
         node.log_output(&docker).await;
-        let _ = node.stop(&docker).await;
-        return Err(error);
+        return match node.stop(&docker).await {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "Smoke setup failed; cleanup also failed: {cleanup_error:#}"
+            ))),
+        };
     }
 
     let fixtures = Fixtures {
@@ -123,83 +141,53 @@ pub async fn run(image: &str) -> Result<Vec<TestResult>> {
     };
 
     // ── Step 4: Collect and run tests ─────────────────────────────────────────
-    let tests = tests::all_tests();
-    let mut results = Vec::new();
 
-    let mut interrupted = false;
-    for test in tests {
-        tracing::info!(test = test.name, "running test");
-        let outcome = tokio::select! {
-            result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                (test.run)(&fixtures),
-            ) => match result {
-                Ok(outcome) => outcome,
-                Err(_) => Err(anyhow::anyhow!("{} timed out after 30 seconds", test.name)),
-            },
-            _ = &mut shutdown => {
-                interrupted = true;
-                break;
+    let execution =
+        futures_util::future::join_all(tests.into_iter().zip(&mut checks).map(|(test, check)| {
+            let fixtures = &fixtures;
+            async move {
+                tracing::info!(test = test.name, "running test");
+                check.outcome = Outcome::Incomplete;
+                check.outcome = match (test.run)(fixtures).await {
+                    Ok(()) => {
+                        tracing::info!(test = test.name, "PASS");
+                        Outcome::Passed
+                    }
+                    Err(error) => {
+                        tracing::error!(test = test.name, error = %error, "FAIL");
+                        Outcome::Failed(format!("{error:#}"))
+                    }
+                };
             }
-        };
-        let result = match outcome {
-            Ok(()) => {
-                tracing::info!(test = test.name, "PASS");
-                TestResult {
-                    name: test.name.to_string(),
-                    passed: true,
-                    message: None,
-                }
-            }
-            Err(e) => {
-                tracing::error!(test = test.name, error = %e, "FAIL");
-                TestResult {
-                    name: test.name.to_string(),
-                    passed: false,
-                    message: Some(format!("{e:#}")),
-                }
-            }
-        };
-        results.push(result);
-    }
+        }));
+    let interrupted = tokio::select! {
+        _ = execution => false,
+        _ = &mut shutdown => true,
+    };
+
+    checks.push(Check {
+        group: "Suite lifecycle".into(),
+        name: "Execution".into(),
+        outcome: if interrupted {
+            Outcome::Failed("Received termination signal during test execution".into())
+        } else {
+            Outcome::Passed
+        },
+    });
 
     // ── Step 5: Teardown (always) ─────────────────────────────────────────────
-    if let Err(e) = fixtures.validator_node.stop(&docker).await {
-        return Err(e.context("Smoke suite teardown failed"));
-    }
-
-    if interrupted {
-        anyhow::bail!("received termination signal during test execution");
-    }
-
-    if results.is_empty() {
-        tracing::info!("no tests registered — nothing to run");
-    }
-
-    Ok(results)
-}
-
-/// Print a human-readable summary of the test run to stdout.
-pub fn print_summary(results: &[TestResult]) {
-    if results.is_empty() {
-        println!("\nno tests registered — nothing to run.");
-        return;
-    }
-
-    let total = results.len();
-    let passed = results.iter().filter(|r| r.passed).count();
-    let failed = total - passed;
-
-    println!("\n{}", "─".repeat(60));
-    for r in results {
-        let status = if r.passed { "PASS" } else { "FAIL" };
-        print!("  [{status}] {}", r.name);
-        if let Some(msg) = &r.message {
-            print!("  — {msg}");
-        }
-        println!();
-    }
-    println!("{}", "─".repeat(60));
-    println!("  {total} tests run — {passed} passed, {failed} failed");
-    println!("{}\n", "─".repeat(60));
+    let cleanup = fixtures.validator_node.stop(&docker).await;
+    checks.push(Check {
+        group: "Suite lifecycle".into(),
+        name: "Cleanup".into(),
+        outcome: match cleanup {
+            Ok(()) => Outcome::Passed,
+            Err(error) => Outcome::Failed(format!("{error:#}")),
+        },
+    });
+    Ok(SuiteReport {
+        title: format!("Smoke — {protocol}"),
+        elapsed: started.elapsed(),
+        checks,
+    })
 }

@@ -2,10 +2,18 @@ use super::super::Fixtures;
 use anyhow::{Context, bail};
 use std::time::Duration;
 
+pub(super) fn tests() -> Vec<super::Test> {
+    vec![super::Test {
+        group: "Finalization",
+        name: "Last finalized block advances",
+        run: Box::new(|fixtures| Box::pin(last_finalised_block_advances(fixtures))),
+    }]
+}
+
 const TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub async fn last_finalised_block_advances(fixtures: &Fixtures) -> anyhow::Result<()> {
+async fn last_finalised_block_advances(fixtures: &Fixtures) -> anyhow::Result<()> {
     let mut client = fixtures.validator_node.connect().await?;
     let initial = client
         .get_consensus_info()

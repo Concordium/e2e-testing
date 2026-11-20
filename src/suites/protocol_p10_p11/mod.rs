@@ -6,6 +6,7 @@ mod state;
 mod tests;
 mod wait;
 
+use super::report::{Check, Outcome as ReportOutcome, SuiteReport};
 use crate::fixture::{
     genesis::GenesisFixture,
     node::{NodeConfig, NodeFixture},
@@ -17,7 +18,7 @@ use concordium_rust_sdk::{
     base::updates::UpdatePayload, common::types::TransactionTime, id::types::AccountAddress,
     v2::BlockIdentifier,
 };
-use registry::{CleanupContext, TestContext, TestRegistry, TestResult};
+use registry::{CleanupContext, TestContext, TestRegistry};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use wait::{block as wait_block, bounded};
@@ -40,7 +41,7 @@ pub struct Config {
 
 /// Print acceptance coverage after unconditional cleanup on controlled exit.
 /// Clean up test-owned resources before validators. Panics/hard stops are not covered.
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(config: Config) -> Result<SuiteReport> {
     let cancellation = CancellationToken::new();
     let mut tests = tests::register(cancellation.clone());
     // Bound individual Docker requests without dropping whole resource-changing hooks.
@@ -73,11 +74,36 @@ pub async fn run(config: Config) -> Result<()> {
     } else {
         Err(anyhow::anyhow!(cleanup_errors.join("; ")))
     };
-    let passed =
-        outcome.is_ok() && cleanup.is_ok() && results.iter().all(|check| check.result.is_ok());
-    render(&outcome, &cleanup, started.elapsed(), &results, passed);
-    ensure!(passed, "P10 -> P11 suite failed; see results above");
-    Ok(())
+    Ok(SuiteReport {
+        title: "P10 → P11 continuity".into(),
+        elapsed: started.elapsed(),
+        checks: results
+            .into_iter()
+            .map(|result| Check {
+                group: result.group.into(),
+                name: result.name,
+                outcome: result.result,
+            })
+            .chain([
+                Check {
+                    group: "Suite lifecycle".into(),
+                    name: "Execution".into(),
+                    outcome: match outcome {
+                        Ok(()) => ReportOutcome::Passed,
+                        Err(error) => ReportOutcome::Failed(format!("{error:#}")),
+                    },
+                },
+                Check {
+                    group: "Suite lifecycle".into(),
+                    name: "Cleanup".into(),
+                    outcome: match cleanup {
+                        Ok(()) => ReportOutcome::Passed,
+                        Err(error) => ReportOutcome::Failed(format!("{error:#}")),
+                    },
+                },
+            ])
+            .collect(),
+    })
 }
 
 async fn execute(
@@ -286,43 +312,4 @@ async fn execute(
         .run_test_hook(&|test| test.finish_after_update(&context))
         .await?;
     Ok(())
-}
-
-fn render(
-    outcome: &Result<()>,
-    cleanup: &Result<()>,
-    elapsed: Duration,
-    results: &[TestResult],
-    passed: bool,
-) {
-    println!("P10 -> P11 acceptance results");
-    let mut previous_group = None;
-    for TestResult {
-        group,
-        name,
-        result,
-    } in results
-    {
-        if previous_group != Some(*group) {
-            println!("  {group}");
-            previous_group = Some(*group);
-        }
-        match result {
-            Ok(()) => println!("    [PASS] {name}"),
-            Err(error) => println!("    [FAIL] {name}: {error:#}"),
-        }
-    }
-    println!("  Suite lifecycle");
-    if let Err(error) = outcome {
-        println!("    [FAIL] execution: {error:#}");
-    }
-    match cleanup {
-        Ok(()) => println!("    [PASS] cleanup"),
-        Err(error) => println!("    [FAIL] cleanup: {error:#}"),
-    }
-    println!(
-        "  Result: {} ({:.1}s)\n",
-        if passed { "PASS" } else { "FAIL" },
-        elapsed.as_secs_f64()
-    );
 }

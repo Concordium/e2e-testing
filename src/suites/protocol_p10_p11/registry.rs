@@ -1,5 +1,6 @@
 //! Preparation, direct lifecycle dispatch, unconditional cleanup and final reporting.
 
+use super::super::report::Outcome as ReportOutcome;
 use crate::fixture::{genesis::GenesisAccount, node::NodeFixture};
 use anyhow::{Result, ensure};
 use bollard::Docker;
@@ -101,7 +102,7 @@ pub(super) struct TestRegistry {
 pub(super) struct TestResult {
     pub group: &'static str,
     pub name: String,
-    pub result: Result<()>,
+    pub result: ReportOutcome,
 }
 
 /// Registers checks under one display header in the registry's flat test list.
@@ -265,12 +266,10 @@ impl TestRegistry {
             .into_iter()
             .map(|registered| {
                 let result = match registered.state {
-                    TestState::Unprepared | TestState::Running => Err(anyhow::anyhow!(
-                        "Incomplete test: {}",
-                        registered.test.name()
-                    )),
-                    TestState::Failed(err) => Err(err),
-                    TestState::Complete => Ok(()),
+                    TestState::Unprepared => ReportOutcome::NotRun,
+                    TestState::Running => ReportOutcome::Incomplete,
+                    TestState::Failed(err) => ReportOutcome::Failed(format!("{err:#}")),
+                    TestState::Complete => ReportOutcome::Passed,
                 };
                 TestResult {
                     group: registered.group,
@@ -428,11 +427,12 @@ mod tests {
             ]
         );
         let results = registry.finish();
-        assert!(results.iter().all(|test| test.result.is_err()));
-        assert!(
-            format!("{:#}", results[1].result.as_ref().unwrap_err())
-                .contains("prepare_before_update")
-        );
+        assert!(matches!(results[0].result, ReportOutcome::Incomplete));
+        assert!(matches!(
+            &results[1].result,
+            ReportOutcome::Failed(message) if message.contains("prepare_before_update")
+        ));
+        assert!(matches!(results[2].result, ReportOutcome::NotRun));
         Ok(())
     }
 
@@ -472,8 +472,8 @@ mod tests {
             ]
         );
         let results = registry.finish();
-        assert!(results[0].result.is_err());
-        assert!(results[1].result.is_ok());
+        assert!(matches!(results[0].result, ReportOutcome::Failed(_)));
+        assert!(results[1].result.is_passed());
         Ok(())
     }
 
@@ -512,7 +512,7 @@ mod tests {
                 "early:cleanup"
             ]
         );
-        assert!(registry.finish().iter().all(|test| test.result.is_ok()));
+        assert!(registry.finish().iter().all(|test| test.result.is_passed()));
         Ok(())
     }
 
@@ -552,8 +552,8 @@ mod tests {
             ]
         );
         let results = registry.finish();
-        assert!(results[0].result.is_ok());
-        assert!(results[1].result.is_err());
+        assert!(results[0].result.is_passed());
+        assert!(matches!(results[1].result, ReportOutcome::Incomplete));
         Ok(())
     }
 
@@ -579,7 +579,7 @@ mod tests {
             })
             .await?;
         assert!(events.borrow().is_empty());
-        assert!(registry.finish()[0].result.is_err());
+        assert!(matches!(registry.finish()[0].result, ReportOutcome::NotRun));
         Ok(())
     }
 
@@ -598,7 +598,7 @@ mod tests {
         registry
             .run_test_hook(&|test| test.run_before_update(&context))
             .await?;
-        assert!(registry.finish()[0].result.is_ok());
+        assert!(registry.finish()[0].result.is_passed());
         Ok(())
     }
 }

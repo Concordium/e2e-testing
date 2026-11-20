@@ -75,9 +75,22 @@ impl ProtocolUpgradeTest for TokenContinuity {
             capture(context, &fixture.id),
         )
         .await?;
+        let governor_balance = balance(&before.accounts, &fixture.governor.address)?;
+        let recipient_balance = before
+            .accounts
+            .get(&fixture.recipient.address)
+            .and_then(Option::as_ref)
+            .map(|state| state.balance);
         ensure!(
-            balance(&before.accounts, &fixture.governor.address)? == TokenAmount::from_raw(1090, 0),
-            "Governor preparation balance is incorrect"
+            governor_balance == TokenAmount::from_raw(1090, 0),
+            "Governor preparation balance is incorrect: expected {:?}, got {:?}; \
+             snapshot block {} at height {}; recipient balance {:?}; total supply {:?}",
+            TokenAmount::from_raw(1090, 0),
+            governor_balance,
+            before.block.hash,
+            before.block.height,
+            recipient_balance,
+            before.token.token_state.total_supply
         );
         ensure!(
             balance(&before.accounts, &fixture.recipient.address)? == TokenAmount::from_raw(10, 0),
