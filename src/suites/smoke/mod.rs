@@ -72,7 +72,7 @@ pub async fn run(image: &str) -> Result<Vec<TestResult>> {
 
     // ── Step 1: Generate genesis ──────────────────────────────────────────────
     tracing::info!("generating genesis block...");
-    let genesis = GenesisFixture::single_validator_p10()?;
+    let genesis = GenesisFixture::single_validator_p11()?;
     tracing::info!(
         validators = genesis.validators.len(),
         accounts = genesis.accounts.len(),
