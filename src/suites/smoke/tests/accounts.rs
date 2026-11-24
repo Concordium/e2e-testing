@@ -7,12 +7,13 @@ use concordium_rust_sdk::{
 };
 use std::time::Duration;
 
-pub(super) fn tests() -> Vec<super::Test> {
-    vec![super::Test {
-        group: "Accounts",
-        name: "Validator account exists",
-        run: Box::new(|fixtures| Box::pin(validator_account_exists(fixtures))),
-    }]
+pub(super) fn register(registry: &mut crate::registry::TestRegistry<super::Test>) {
+    registry.group("Accounts").register(
+        "Validator account exists",
+        super::Test {
+            run: Box::new(|fixtures| Box::pin(validator_account_exists(fixtures))),
+        },
+    );
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);

@@ -2,12 +2,13 @@ use super::super::Fixtures;
 use anyhow::{Context, bail};
 use std::time::Duration;
 
-pub(super) fn tests() -> Vec<super::Test> {
-    vec![super::Test {
-        group: "Finalization",
-        name: "Last finalized block advances",
-        run: Box::new(|fixtures| Box::pin(last_finalised_block_advances(fixtures))),
-    }]
+pub(super) fn register(registry: &mut crate::registry::TestRegistry<super::Test>) {
+    registry.group("Finalization").register(
+        "Last finalized block advances",
+        super::Test {
+            run: Box::new(|fixtures| Box::pin(last_finalised_block_advances(fixtures))),
+        },
+    );
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);

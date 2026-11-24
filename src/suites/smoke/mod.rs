@@ -10,12 +10,12 @@
 
 mod tests;
 
-use super::report::{Check, Outcome, SuiteReport};
 use super::shutdown_signal;
 use crate::fixture::{
     genesis::GenesisFixture,
     node::{NodeConfig, NodeFixture},
 };
+use crate::report::{Check, Outcome, SuiteReport};
 use anyhow::{Context, Result};
 use bollard::Docker;
 use concordium_rust_sdk::types::{ProtocolVersion, queries::ProtocolVersionInt};
@@ -28,10 +28,6 @@ pub type TestFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>
 
 /// One named smoke check, run concurrently with the other registered checks.
 pub struct Test {
-    /// Feature area used as the report heading.
-    pub group: &'static str,
-    /// Name used in logs and the result summary.
-    pub name: &'static str,
     /// Run this check against the suite's shared chain.
     pub run: Box<dyn for<'a> Fn(&'a Fixtures) -> TestFuture<'a> + Send>,
 }
@@ -49,15 +45,7 @@ pub struct Fixtures {
 /// Always stops the node container before returning, regardless of outcome.
 pub async fn run(image: &str, protocol: ProtocolVersion) -> Result<SuiteReport> {
     let started = Instant::now();
-    let tests = tests::all_tests();
-    let mut checks: Vec<Check> = tests
-        .iter()
-        .map(|test| Check {
-            group: test.group.into(),
-            name: test.name.into(),
-            outcome: Outcome::NotRun,
-        })
-        .collect();
+    let mut registry = tests::register();
     // Install signal handlers before creating any Docker resources. A signal
     // received during startup is retained until the container can be cleaned up.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -143,18 +131,19 @@ pub async fn run(image: &str, protocol: ProtocolVersion) -> Result<SuiteReport> 
     // ── Step 4: Collect and run tests ─────────────────────────────────────────
 
     let execution =
-        futures_util::future::join_all(tests.into_iter().zip(&mut checks).map(|(test, check)| {
+        futures_util::future::join_all(registry.entries_mut().iter_mut().map(|entry| {
             let fixtures = &fixtures;
             async move {
-                tracing::info!(test = test.name, "running test");
+                let check = &mut entry.check;
+                tracing::info!(test = check.name, "running test");
                 check.outcome = Outcome::Incomplete;
-                check.outcome = match (test.run)(fixtures).await {
+                check.outcome = match (entry.definition.run)(fixtures).await {
                     Ok(()) => {
-                        tracing::info!(test = test.name, "PASS");
+                        tracing::info!(test = check.name, "PASS");
                         Outcome::Passed
                     }
                     Err(error) => {
-                        tracing::error!(test = test.name, error = %error, "FAIL");
+                        tracing::error!(test = check.name, error = %error, "FAIL");
                         Outcome::Failed(format!("{error:#}"))
                     }
                 };
@@ -164,6 +153,7 @@ pub async fn run(image: &str, protocol: ProtocolVersion) -> Result<SuiteReport> 
         _ = execution => false,
         _ = &mut shutdown => true,
     };
+    let mut checks = registry.into_checks();
 
     checks.push(Check {
         group: "Suite lifecycle".into(),

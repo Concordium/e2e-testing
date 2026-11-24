@@ -1,5 +1,5 @@
 //! CCD transfers and reward-aware balance/nonce preservation.
-use super::super::registry::{ProtocolUpgradeTest, TestContext, TestProgress, TestRegistry};
+use super::super::lifecycle::{ProtocolUpgradeTest, TestContext, TestProgress, UpgradeRegistry};
 use super::super::{
     REJOIN_TIMEOUT, operations,
     state::{FinalizedBlock, rewards_between},
@@ -10,11 +10,21 @@ use anyhow::{Context as _, Result, ensure};
 use concordium_rust_sdk::{common::types::Amount, id::types::AccountAddress, types::Nonce};
 use std::collections::BTreeMap;
 
-pub(super) fn register(registry: &mut TestRegistry) {
-    let mut registry = registry.group("CCD transfers");
-    registry.register(PreUpdateTransfer::default());
-    registry.register(AccountPreservation::default());
-    registry.register(P11Transfer::default());
+pub(super) fn register(registry: &mut UpgradeRegistry) {
+    registry
+        .group("CCD transfers")
+        .register(
+            "CCD transfers finalize before the update",
+            Box::new(PreUpdateTransfer::default()),
+        )
+        .register(
+            "CCD balances and nonces survive activation, accounting for rewards",
+            Box::new(AccountPreservation::default()),
+        )
+        .register(
+            "A fresh CCD transfer finalizes at P11",
+            Box::new(P11Transfer::default()),
+        );
 }
 
 struct TransferAccounts {
@@ -33,9 +43,6 @@ impl TransferAccounts {
 struct PreUpdateTransfer(Option<TransferAccounts>);
 #[async_trait::async_trait(?Send)]
 impl ProtocolUpgradeTest for PreUpdateTransfer {
-    fn name(&self) -> String {
-        "CCD transfers finalize before the update".into()
-    }
     fn required_accounts(&self) -> usize {
         2
     }
@@ -63,9 +70,6 @@ impl ProtocolUpgradeTest for PreUpdateTransfer {
 struct P11Transfer(Option<TransferAccounts>);
 #[async_trait::async_trait(?Send)]
 impl ProtocolUpgradeTest for P11Transfer {
-    fn name(&self) -> String {
-        "A fresh CCD transfer finalizes at P11".into()
-    }
     fn required_accounts(&self) -> usize {
         2
     }
@@ -96,9 +100,6 @@ struct AccountPreservation {
 }
 #[async_trait::async_trait(?Send)]
 impl ProtocolUpgradeTest for AccountPreservation {
-    fn name(&self) -> String {
-        "CCD balances and nonces survive activation, accounting for rewards".into()
-    }
     async fn finish_before_update(&mut self, context: &TestContext<'_>) -> Result<TestProgress> {
         let before =
             wait::bounded("capture CCD baseline", REJOIN_TIMEOUT, capture(context)).await?;

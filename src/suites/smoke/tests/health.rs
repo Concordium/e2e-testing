@@ -2,19 +2,21 @@ use super::super::Fixtures;
 use anyhow::{Context, ensure};
 use std::time::Duration;
 
-pub(super) fn tests() -> Vec<super::Test> {
-    vec![
-        super::Test {
-            group: "Health",
-            name: "Node is reachable",
-            run: Box::new(|fixtures| Box::pin(node_is_reachable(fixtures))),
-        },
-        super::Test {
-            group: "Health",
-            name: "Node produces blocks",
-            run: Box::new(|fixtures| Box::pin(node_produces_blocks(fixtures))),
-        },
-    ]
+pub(super) fn register(registry: &mut crate::registry::TestRegistry<super::Test>) {
+    registry
+        .group("Health")
+        .register(
+            "Node is reachable",
+            super::Test {
+                run: Box::new(|fixtures| Box::pin(node_is_reachable(fixtures))),
+            },
+        )
+        .register(
+            "Node produces blocks",
+            super::Test {
+                run: Box::new(|fixtures| Box::pin(node_produces_blocks(fixtures))),
+            },
+        );
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);

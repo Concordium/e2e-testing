@@ -2,9 +2,9 @@
 pub(super) mod support;
 
 use super::super::{
-    REJOIN_TIMEOUT, operations,
-    registry::{ProtocolUpgradeTest, TestContext, TestProgress, TestRegistry},
-    wait,
+    REJOIN_TIMEOUT,
+    lifecycle::{ProtocolUpgradeTest, TestContext, TestProgress, UpgradeRegistry},
+    operations, wait,
 };
 use crate::fixture::genesis::GenesisAccount;
 use anyhow::{Context as _, Result, ensure};
@@ -15,10 +15,11 @@ use concordium_rust_sdk::{
 use std::collections::BTreeMap;
 use support::{Fixture, Snapshot, capture, token_equivalent};
 
-pub(super) fn register(registry: &mut TestRegistry) {
-    registry
-        .group("Tokens")
-        .register(TokenContinuity::default());
+pub(super) fn register(registry: &mut UpgradeRegistry) {
+    registry.group("Tokens").register(
+        "Token creation, minting, transfers, and preservation across P11",
+        Box::new(TokenContinuity::default()),
+    );
 }
 
 #[derive(Default)]
@@ -29,10 +30,6 @@ struct TokenContinuity {
 
 #[async_trait::async_trait(?Send)]
 impl ProtocolUpgradeTest for TokenContinuity {
-    fn name(&self) -> String {
-        "Token creation, minting, transfers, and preservation across P11".into()
-    }
-
     fn required_accounts(&self) -> usize {
         2
     }

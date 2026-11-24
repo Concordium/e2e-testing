@@ -1,24 +1,24 @@
 //! Ordered P10 -> P11 network lifecycle with test-owned acceptance checks.
+mod lifecycle;
 mod operations;
 mod payload;
-mod registry;
 mod state;
 mod tests;
 mod wait;
 
-use super::report::{Check, Outcome as ReportOutcome, SuiteReport};
 use crate::fixture::{
     genesis::GenesisFixture,
     node::{NodeConfig, NodeFixture},
     nodes,
 };
+use crate::report::{Check, Outcome as ReportOutcome, SuiteReport};
 use anyhow::{Context, Result, ensure};
 use bollard::Docker;
 use concordium_rust_sdk::{
     base::updates::UpdatePayload, common::types::TransactionTime, id::types::AccountAddress,
     v2::BlockIdentifier,
 };
-use registry::{CleanupContext, TestContext, TestRegistry};
+use lifecycle::{CleanupContext, TestContext, UpgradeRegistry};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use wait::{block as wait_block, bounded};
@@ -43,7 +43,7 @@ pub struct Config {
 /// Clean up test-owned resources before validators. Panics/hard stops are not covered.
 pub async fn run(config: Config) -> Result<SuiteReport> {
     let cancellation = CancellationToken::new();
-    let mut tests = tests::register(cancellation.clone());
+    let mut tests = tests::register();
     // Bound individual Docker requests without dropping whole resource-changing hooks.
     let docker = Docker::connect_with_local_defaults()?.with_timeout(Duration::from_secs(10));
     let signal_task = {
@@ -59,11 +59,11 @@ pub async fn run(config: Config) -> Result<SuiteReport> {
     let outcome = execute(&docker, config, &mut tests, &mut validators, &cancellation).await;
     // Cleanup is outside the cancellation boundary and independent of test status.
     tracing::info!("Run test 'cleanup' hooks");
-    let test_cleanup = tests.cleanup(&CleanupContext { docker: &docker }).await;
+    let test_cleanup = lifecycle::cleanup(&mut tests, &CleanupContext { docker: &docker }).await;
     tracing::info!("Cleanup validators");
     let validator_cleanup = nodes::stop(validators, &docker).await;
     signal_task.abort();
-    let results = tests.finish();
+    let results = tests.into_checks();
     let cleanup_errors: Vec<_> = [test_cleanup, validator_cleanup]
         .into_iter()
         .filter_map(Result::err)
@@ -79,11 +79,6 @@ pub async fn run(config: Config) -> Result<SuiteReport> {
         elapsed: started.elapsed(),
         checks: results
             .into_iter()
-            .map(|result| Check {
-                group: result.group.into(),
-                name: result.name,
-                outcome: result.result,
-            })
             .chain([
                 Check {
                     group: "Suite lifecycle".into(),
@@ -109,7 +104,7 @@ pub async fn run(config: Config) -> Result<SuiteReport> {
 async fn execute(
     docker: &Docker,
     config: Config,
-    tests: &mut TestRegistry,
+    tests: &mut UpgradeRegistry,
     validators: &mut Vec<NodeFixture>,
     cancellation: &CancellationToken,
 ) -> Result<()> {
@@ -136,8 +131,9 @@ async fn execute(
         update_payload_sha256 = %payload::payload_hash()?, "Resolved test images and payload");
     // --- start: Retain each successful start before readiness checks or cancellation. ---
     tracing::info!("Generating genesis");
-    let mut genesis =
-        GenesisFixture::four_validator_p10_with_accounts(u32::try_from(tests.account_count())?)?;
+    let mut genesis = GenesisFixture::four_validator_p10_with_accounts(u32::try_from(
+        lifecycle::account_count(tests),
+    )?)?;
     let accounts: Vec<AccountAddress> = genesis
         .accounts
         .iter()
@@ -195,15 +191,21 @@ async fn execute(
     }
     // Prepare tests against a ready P10 network before upgrading any validators.
     tracing::info!("Run test 'prepare_before_update' hooks");
-    tests.prepare_before_update(&context, test_accounts).await?;
+    lifecycle::prepare_before_update(tests, &context, test_accounts, cancellation).await?;
     tracing::info!("Run test 'run_before_update' hooks");
-    tests
-        .run_test_hook(&|test| test.run_before_update(&context))
-        .await?;
+    lifecycle::run_test_hook(
+        tests,
+        &|test| test.run_before_update(&context),
+        cancellation,
+    )
+    .await?;
     tracing::info!("Run test 'finish_before_update' hooks");
-    tests
-        .run_test_hook(&|test| test.finish_before_update(&context))
-        .await?;
+    lifecycle::run_test_hook(
+        tests,
+        &|test| test.finish_before_update(&context),
+        cancellation,
+    )
+    .await?;
 
     // --- rolling upgrade: Exercise continuity with each validator offline and rejoined. ---
     for validator in 0..VALIDATOR_COUNT {
@@ -298,18 +300,22 @@ async fn execute(
     .await?;
     // --- prepare after update: Verify preservation and prepare the next operations. ---
     tracing::info!("Run test 'prepare_after_update' hooks");
-    tests
-        .run_test_hook(&|test| test.prepare_after_update(&context))
-        .await?;
+    lifecycle::run_test_hook(
+        tests,
+        &|test| test.prepare_after_update(&context),
+        cancellation,
+    )
+    .await?;
     // --- run after update: Intended for fresh transactions after preservation checks. ---
     tracing::info!("Run test 'run_after_update' hooks");
-    tests
-        .run_test_hook(&|test| test.run_after_update(&context))
-        .await?;
+    lifecycle::run_test_hook(tests, &|test| test.run_after_update(&context), cancellation).await?;
     // Every post-update operation finishes before final test-local verification.
     tracing::info!("Run test 'finish_after_update' hooks");
-    tests
-        .run_test_hook(&|test| test.finish_after_update(&context))
-        .await?;
+    lifecycle::run_test_hook(
+        tests,
+        &|test| test.finish_after_update(&context),
+        cancellation,
+    )
+    .await?;
     Ok(())
 }

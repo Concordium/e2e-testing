@@ -1,5 +1,5 @@
 //! Token scenario fixtures and evidence at exact finalized blocks.
-use super::super::super::{operations, registry::TestContext, state::FinalizedBlock, wait};
+use super::super::super::{lifecycle::TestContext, operations, state::FinalizedBlock, wait};
 use crate::fixture::genesis::GenesisAccount;
 use anyhow::{Context as _, Result};
 use concordium_rust_sdk::{

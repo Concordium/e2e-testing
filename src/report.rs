@@ -2,11 +2,16 @@
 
 use std::{fmt, time::Duration};
 
+/// A check's status. Preparation semantics apply to registered tests.
 #[derive(Debug)]
 pub enum Outcome {
+    /// Preparation started and the check completed successfully.
     Passed,
+    /// Preparation started and preparation or execution failed.
     Failed(String),
+    /// Preparation has never started; test-owned cleanup must not run.
     NotRun,
+    /// Preparation started, but the check has not completed.
     Incomplete,
 }
 

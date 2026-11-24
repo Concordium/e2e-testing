@@ -3,6 +3,8 @@ use clap::Parser;
 
 mod cli;
 mod fixture;
+mod registry;
+mod report;
 mod suites;
 
 #[tokio::main]

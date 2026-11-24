@@ -1,5 +1,4 @@
 pub mod protocol_p10_p11;
-pub(crate) mod report;
 pub mod smoke;
 
 /// Wait for Ctrl-C or, on Unix, SIGTERM. The caller must perform cleanup.

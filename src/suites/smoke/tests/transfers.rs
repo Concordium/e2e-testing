@@ -7,12 +7,13 @@ use concordium_rust_sdk::{
 };
 use std::time::Duration;
 
-pub(super) fn tests() -> Vec<super::Test> {
-    vec![super::Test {
-        group: "CCD transfers",
-        name: "Transfer is finalized",
-        run: Box::new(|fixtures| Box::pin(ccd_transfer_is_finalised(fixtures))),
-    }]
+pub(super) fn register(registry: &mut crate::registry::TestRegistry<super::Test>) {
+    registry.group("CCD transfers").register(
+        "Transfer is finalized",
+        super::Test {
+            run: Box::new(|fixtures| Box::pin(ccd_transfer_is_finalised(fixtures))),
+        },
+    );
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);

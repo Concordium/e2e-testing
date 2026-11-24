@@ -1,7 +1,8 @@
 //! Preparation, direct lifecycle dispatch, unconditional cleanup and final reporting.
 
-use super::super::report::Outcome as ReportOutcome;
 use crate::fixture::{genesis::GenesisAccount, node::NodeFixture};
+use crate::registry::TestRegistry;
+use crate::report::Outcome as ReportOutcome;
 use anyhow::{Result, ensure};
 use bollard::Docker;
 use concordium_rust_sdk::{genesis::output::GeneratedKeyPair, id::types::AccountAddress};
@@ -39,9 +40,6 @@ pub(in super::super) enum TestProgress {
 
 #[async_trait::async_trait(?Send)]
 pub trait ProtocolUpgradeTest {
-    /// The display name for the test.
-    fn name(&self) -> String;
-
     /// The number of genesis accounts required by the test.
     /// This number of accounts are then provided to the `prepare_before_update` hook.
     fn required_accounts(&self) -> usize {
@@ -90,195 +88,106 @@ pub trait ProtocolUpgradeTest {
     }
 }
 
-/// Owns tests, prepares them sequentially, and dispatches hooks to running tests.
-pub(super) struct TestRegistry {
-    /// Tests in registration order, each with private state and one expected result.
-    tests: Vec<Registered>,
-    /// Cancellation is observed centrally between preparation/execution hooks.
-    cancellation: CancellationToken,
-}
-
-/// One acceptance check's group, display name, and final outcome.
-pub(super) struct TestResult {
-    pub group: &'static str,
-    pub name: String,
-    pub result: ReportOutcome,
-}
-
-/// Registers checks under one display header in the registry's flat test list.
-pub(super) struct TestGroup<'a> {
-    registry: &'a mut TestRegistry,
-    header: &'static str,
-}
-
-impl TestGroup<'_> {
-    pub(super) fn register<A: ProtocolUpgradeTest + 'static>(&mut self, test_definition: A) {
-        self.registry.tests.push(Registered {
-            group: self.header,
-            test: Box::new(test_definition),
-            state: TestState::Unprepared,
-        });
-    }
-}
-
-/// Internal state for each registered test in the registry.
-struct Registered {
-    group: &'static str,
-    /// The test definition.
-    test: Box<dyn ProtocolUpgradeTest>,
-    /// The run state of the registered test.
-    state: TestState,
-}
-
-/// Current state of a registered test.
-enum TestState {
-    /// Initial state once registered.
-    Unprepared,
-    /// State after successful preparation.
-    Running,
-    /// State after test hook signals completion.
-    Complete,
-    /// State once a test hook results in error.
-    Failed(anyhow::Error),
-}
+pub(super) type UpgradeRegistry = TestRegistry<Box<dyn ProtocolUpgradeTest>>;
 
 type HookWork<'a> = Pin<Box<dyn Future<Output = Result<TestProgress>> + 'a>>;
 
-impl TestRegistry {
-    pub(super) fn new(cancellation: CancellationToken) -> Self {
-        Self {
-            tests: Vec::new(),
-            cancellation,
+pub(super) fn account_count(executor: &UpgradeRegistry) -> usize {
+    executor
+        .entries()
+        .iter()
+        .map(|entry| entry.definition.required_accounts())
+        .sum()
+}
+
+/// Prepare tests sequentially, assigning exclusive accounts in registration order.
+/// Stop on failure; callers must still clean up every started preparation.
+pub(super) async fn prepare_before_update(
+    executor: &mut UpgradeRegistry,
+    context: &TestContext<'_>,
+    accounts: Vec<GenesisAccount>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut accounts = accounts.into_iter();
+    for registered in executor.entries_mut() {
+        let accounts = accounts
+            .by_ref()
+            .take(registered.definition.required_accounts())
+            .collect();
+        ensure!(!cancellation.is_cancelled(), "Termination requested");
+        // Mark before awaiting so partial preparation is eligible for cleanup.
+        registered.check.outcome = ReportOutcome::Incomplete;
+        if let Err(error) = registered
+            .definition
+            .prepare_before_update(context, accounts)
+            .await
+        {
+            let name = &registered.check.name;
+            registered.check.outcome =
+                ReportOutcome::Failed(format!("prepare_before_update: {error:#}"));
+            return Err(error.context(format!("Prepare {name}")));
         }
     }
+    Ok(())
+}
 
-    pub(super) fn group(&mut self, header: &'static str) -> TestGroup<'_> {
-        TestGroup {
-            registry: self,
-            header,
+/// Clean up every started preparation in reverse registration order.
+/// Attempt all eligible cleanups and aggregate failures.
+pub(super) async fn cleanup(
+    executor: &mut UpgradeRegistry,
+    context: &CleanupContext<'_>,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    for registered in executor.entries_mut().iter_mut().rev() {
+        if matches!(registered.check.outcome, ReportOutcome::NotRun) {
+            continue;
+        }
+        if let Err(error) = registered.definition.cleanup(context).await {
+            errors.push(format!("{}: {error:#}", registered.check.name));
         }
     }
+    ensure!(
+        errors.is_empty(),
+        "Test cleanup failed: {}",
+        errors.join("; ")
+    );
+    Ok(())
+}
 
-    pub fn account_count(&self) -> usize {
-        self.tests
-            .iter()
-            .map(|test| test.test.required_accounts())
-            .sum()
-    }
-
-    /// Run the prepare hooks distributing the requested accounts between each test.
-    ///
-    /// Fails immediately if any test results in error during preparation.
-    /// Caller must ensure to run cleanup afterwards.
-    pub async fn prepare_before_update(
-        &mut self,
-        context: &TestContext<'_>,
-        accounts: Vec<GenesisAccount>,
-    ) -> Result<()> {
-        let mut accounts = accounts.into_iter();
-        for registered in &mut self.tests {
-            let accounts = accounts
-                .by_ref()
-                .take(registered.test.required_accounts())
-                .collect();
-            ensure!(!self.cancellation.is_cancelled(), "Termination requested");
-            // Mark before awaiting so partial preparation is eligible for cleanup.
-            registered.state = TestState::Running;
-            if let Err(error) = registered
-                .test
-                .prepare_before_update(context, accounts)
-                .await
-            {
-                let name = registered.test.name();
-                registered.state =
-                    TestState::Failed(anyhow::anyhow!("prepare_before_update: {error:#}"));
-                return Err(error.context(format!("Prepare {name}")));
+/// Dispatch a phase to incomplete tests and aggregate hook failures.
+pub(super) async fn run_test_hook<'a>(
+    executor: &'a mut UpgradeRegistry,
+    hook: &impl Fn(&'a mut dyn ProtocolUpgradeTest) -> HookWork<'a>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let result = try_join_all(executor.entries_mut().iter_mut().map(|registered| {
+        let cancellation = cancellation.clone();
+        async move {
+            if !matches!(registered.check.outcome, ReportOutcome::Incomplete) {
+                return Ok(None);
+            }
+            ensure!(!cancellation.is_cancelled(), "Termination requested");
+            let name = &registered.check.name;
+            registered.check.outcome = match hook(registered.definition.as_mut()).await {
+                Ok(TestProgress::Passed) => ReportOutcome::Passed,
+                Ok(TestProgress::Pending) => ReportOutcome::Incomplete,
+                Err(err) => ReportOutcome::Failed(format!("{err:#}")),
+            };
+            if let ReportOutcome::Failed(err) = &registered.check.outcome {
+                Ok(Some(format!("{name}: {err}")))
+            } else {
+                Ok(None)
             }
         }
-        Ok(())
-    }
-
-    /// Run cleanup hooks for every prepared test in reverse registration order.
-    ///
-    /// If any cleanup hook fails, the error is collected and remaining cleanup hooks are still run.
-    /// The final result is Ok if no errors are produced otherwise an Err representing the
-    /// collection of errors are returned.
-    pub async fn cleanup(&mut self, context: &CleanupContext<'_>) -> Result<()> {
-        let mut errors = Vec::new();
-        for registered in self.tests.iter_mut().rev() {
-            if matches!(registered.state, TestState::Unprepared) {
-                continue;
-            }
-            if let Err(error) = registered.test.cleanup(context).await {
-                errors.push(format!("{}: {error:#}", registered.test.name()));
-            }
-        }
-        ensure!(
-            errors.is_empty(),
-            "Test cleanup failed: {}",
-            errors.join("; ")
-        );
-        Ok(())
-    }
-
-    /// Trigger test hooks on every running test and update their run state based on the result.
-    ///
-    /// If any hook call fails, the error is collected and remaining hooks are still run.
-    /// The final result is Ok if no errors are produced otherwise an Err representing the
-    /// collection of errors are returned.
-    pub async fn run_test_hook<'a>(
-        &'a mut self,
-        hook: &impl Fn(&'a mut dyn ProtocolUpgradeTest) -> HookWork<'a>,
-    ) -> Result<()> {
-        let result = try_join_all(self.tests.iter_mut().map(|registered| {
-            let cancellation = self.cancellation.clone();
-            async move {
-                if !matches!(registered.state, TestState::Running) {
-                    return Ok(None);
-                }
-                ensure!(!cancellation.is_cancelled(), "Termination requested");
-                let name = registered.test.name();
-                registered.state = match hook(registered.test.as_mut()).await {
-                    Ok(TestProgress::Passed) => TestState::Complete,
-                    Ok(TestProgress::Pending) => TestState::Running,
-                    Err(err) => TestState::Failed(err),
-                };
-                if let TestState::Failed(err) = &registered.state {
-                    Ok(Some(format!("{name}: {err}")))
-                } else {
-                    Ok(None)
-                }
-            }
-        }))
-        .await?;
-        let errors: Vec<_> = result.into_iter().flatten().collect();
-        ensure!(
-            errors.is_empty(),
-            "Test phase failed: {}",
-            errors.join("; ")
-        );
-        Ok(())
-    }
-
-    /// Convert the registry of tests into the final test results.
-    pub fn finish(self) -> Vec<TestResult> {
-        self.tests
-            .into_iter()
-            .map(|registered| {
-                let result = match registered.state {
-                    TestState::Unprepared => ReportOutcome::NotRun,
-                    TestState::Running => ReportOutcome::Incomplete,
-                    TestState::Failed(err) => ReportOutcome::Failed(format!("{err:#}")),
-                    TestState::Complete => ReportOutcome::Passed,
-                };
-                TestResult {
-                    group: registered.group,
-                    name: registered.test.name(),
-                    result,
-                }
-            })
-            .collect()
-    }
+    }))
+    .await?;
+    let errors: Vec<_> = result.into_iter().flatten().collect();
+    ensure!(
+        errors.is_empty(),
+        "Test phase failed: {}",
+        errors.join("; ")
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -325,10 +234,6 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl ProtocolUpgradeTest for FakeTest {
-        fn name(&self) -> String {
-            self.name.into()
-        }
-
         async fn prepare_before_update(
             &mut self,
             _context: &TestContext<'_>,
@@ -393,29 +298,36 @@ mod tests {
     async fn partial_preparation_stops_and_cleans_up_in_reverse_order() -> Result<()> {
         let mut fixtures = Fixtures::new()?;
         let events = Rc::new(RefCell::new(Vec::new()));
-        let mut registry = TestRegistry::new(CancellationToken::new());
+        let cancellation = CancellationToken::new();
+        let mut registry = UpgradeRegistry::default();
         let first = FakeTest::new("first", &events);
         let mut second = FakeTest::new("second", &events);
         second.prepare_fails = true;
         second.cleanup_fails = true;
         let mut group = registry.group("fake");
-        group.register(first);
-        group.register(second);
-        group.register(FakeTest::new("unstarted", &events));
+        group.register("first", Box::new(first));
+        group.register("second", Box::new(second));
+        group.register("unstarted", Box::new(FakeTest::new("unstarted", &events)));
 
         assert!(
-            registry
-                .prepare_before_update(&fixtures.context(), Vec::new())
-                .await
-                .is_err()
+            prepare_before_update(
+                &mut registry,
+                &fixtures.context(),
+                Vec::new(),
+                &cancellation
+            )
+            .await
+            .is_err()
         );
         assert!(
-            registry
-                .cleanup(&CleanupContext {
-                    docker: &fixtures.docker
-                })
-                .await
-                .is_err()
+            cleanup(
+                &mut registry,
+                &CleanupContext {
+                    docker: &fixtures.docker,
+                },
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             *events.borrow(),
@@ -426,13 +338,13 @@ mod tests {
                 "first:cleanup"
             ]
         );
-        let results = registry.finish();
-        assert!(matches!(results[0].result, ReportOutcome::Incomplete));
+        let results = registry.into_checks();
+        assert!(matches!(results[0].outcome, ReportOutcome::Incomplete));
         assert!(matches!(
-            &results[1].result,
+            &results[1].outcome,
             ReportOutcome::Failed(message) if message.contains("prepare_before_update")
         ));
-        assert!(matches!(results[2].result, ReportOutcome::NotRun));
+        assert!(matches!(results[2].outcome, ReportOutcome::NotRun));
         Ok(())
     }
 
@@ -440,25 +352,32 @@ mod tests {
     async fn phase_failure_finishes_eligible_tests_but_prevents_advancement() -> Result<()> {
         let mut fixtures = Fixtures::new()?;
         let events = Rc::new(RefCell::new(Vec::new()));
-        let mut registry = TestRegistry::new(CancellationToken::new());
+        let cancellation = CancellationToken::new();
+        let mut registry = UpgradeRegistry::default();
         let mut failing = FakeTest::new("failing", &events);
         failing.run = Outcome::Failed;
         let mut passing = FakeTest::new("passing", &events);
         passing.run = Outcome::Passed;
         let mut group = registry.group("fake");
-        group.register(failing);
-        group.register(passing);
+        group.register("failing", Box::new(failing));
+        group.register("passing", Box::new(passing));
         let context = fixtures.context();
-        registry.prepare_before_update(&context, Vec::new()).await?;
+        prepare_before_update(&mut registry, &context, Vec::new(), &cancellation).await?;
 
         // Mirror the runner's `?` barrier between phases.
         let outcome: Result<()> = async {
-            registry
-                .run_test_hook(&|test| test.run_before_update(&context))
-                .await?;
-            registry
-                .run_test_hook(&|test| test.run_after_update(&context))
-                .await
+            run_test_hook(
+                &mut registry,
+                &|test| test.run_before_update(&context),
+                &cancellation,
+            )
+            .await?;
+            run_test_hook(
+                &mut registry,
+                &|test| test.run_after_update(&context),
+                &cancellation,
+            )
+            .await
         }
         .await;
         assert!(outcome.is_err());
@@ -471,9 +390,9 @@ mod tests {
                 "passing:run"
             ]
         );
-        let results = registry.finish();
-        assert!(matches!(results[0].result, ReportOutcome::Failed(_)));
-        assert!(results[1].result.is_passed());
+        let results = registry.into_checks();
+        assert!(matches!(results[0].outcome, ReportOutcome::Failed(_)));
+        assert!(results[1].outcome.is_passed());
         Ok(())
     }
 
@@ -481,25 +400,34 @@ mod tests {
     async fn completed_tests_skip_later_hooks_but_still_receive_cleanup() -> Result<()> {
         let mut fixtures = Fixtures::new()?;
         let events = Rc::new(RefCell::new(Vec::new()));
-        let mut registry = TestRegistry::new(CancellationToken::new());
+        let cancellation = CancellationToken::new();
+        let mut registry = UpgradeRegistry::default();
         let mut early = FakeTest::new("early", &events);
         early.run = Outcome::Passed;
         let mut group = registry.group("fake");
-        group.register(early);
-        group.register(FakeTest::new("ongoing", &events));
+        group.register("early", Box::new(early));
+        group.register("ongoing", Box::new(FakeTest::new("ongoing", &events)));
         let context = fixtures.context();
-        registry.prepare_before_update(&context, Vec::new()).await?;
-        registry
-            .run_test_hook(&|test| test.run_before_update(&context))
-            .await?;
-        registry
-            .run_test_hook(&|test| test.run_after_update(&context))
-            .await?;
-        registry
-            .cleanup(&CleanupContext {
+        prepare_before_update(&mut registry, &context, Vec::new(), &cancellation).await?;
+        run_test_hook(
+            &mut registry,
+            &|test| test.run_before_update(&context),
+            &cancellation,
+        )
+        .await?;
+        run_test_hook(
+            &mut registry,
+            &|test| test.run_after_update(&context),
+            &cancellation,
+        )
+        .await?;
+        cleanup(
+            &mut registry,
+            &CleanupContext {
                 docker: &fixtures.docker,
-            })
-            .await?;
+            },
+        )
+        .await?;
         assert_eq!(
             *events.borrow(),
             [
@@ -512,7 +440,12 @@ mod tests {
                 "early:cleanup"
             ]
         );
-        assert!(registry.finish().iter().all(|test| test.result.is_passed()));
+        assert!(
+            registry
+                .into_checks()
+                .iter()
+                .all(|test| test.outcome.is_passed())
+        );
         Ok(())
     }
 
@@ -521,26 +454,31 @@ mod tests {
         let mut fixtures = Fixtures::new()?;
         let events = Rc::new(RefCell::new(Vec::new()));
         let cancellation = CancellationToken::new();
-        let mut registry = TestRegistry::new(cancellation.clone());
+        let mut registry = UpgradeRegistry::default();
         let mut first = FakeTest::new("first", &events);
-        first.cancel_on_run = Some(cancellation);
+        first.cancel_on_run = Some(cancellation.clone());
         first.run = Outcome::Passed;
         let mut group = registry.group("fake");
-        group.register(first);
-        group.register(FakeTest::new("second", &events));
+        group.register("first", Box::new(first));
+        group.register("second", Box::new(FakeTest::new("second", &events)));
         let context = fixtures.context();
-        registry.prepare_before_update(&context, Vec::new()).await?;
+        prepare_before_update(&mut registry, &context, Vec::new(), &cancellation).await?;
         assert!(
-            registry
-                .run_test_hook(&|test| test.run_before_update(&context))
-                .await
-                .is_err()
+            run_test_hook(
+                &mut registry,
+                &|test| test.run_before_update(&context),
+                &cancellation
+            )
+            .await
+            .is_err()
         );
-        registry
-            .cleanup(&CleanupContext {
+        cleanup(
+            &mut registry,
+            &CleanupContext {
                 docker: &fixtures.docker,
-            })
-            .await?;
+            },
+        )
+        .await?;
         assert_eq!(
             *events.borrow(),
             [
@@ -551,9 +489,9 @@ mod tests {
                 "first:cleanup"
             ]
         );
-        let results = registry.finish();
-        assert!(results[0].result.is_passed());
-        assert!(matches!(results[1].result, ReportOutcome::Incomplete));
+        let results = registry.into_checks();
+        assert!(results[0].outcome.is_passed());
+        assert!(matches!(results[1].outcome, ReportOutcome::Incomplete));
         Ok(())
     }
 
@@ -563,23 +501,32 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let cancellation = CancellationToken::new();
         cancellation.cancel();
-        let mut registry = TestRegistry::new(cancellation);
+        let mut registry = UpgradeRegistry::default();
         registry
             .group("fake")
-            .register(FakeTest::new("unstarted", &events));
+            .register("unstarted", Box::new(FakeTest::new("unstarted", &events)));
         assert!(
-            registry
-                .prepare_before_update(&fixtures.context(), Vec::new())
-                .await
-                .is_err()
+            prepare_before_update(
+                &mut registry,
+                &fixtures.context(),
+                Vec::new(),
+                &cancellation
+            )
+            .await
+            .is_err()
         );
-        registry
-            .cleanup(&CleanupContext {
+        cleanup(
+            &mut registry,
+            &CleanupContext {
                 docker: &fixtures.docker,
-            })
-            .await?;
+            },
+        )
+        .await?;
         assert!(events.borrow().is_empty());
-        assert!(matches!(registry.finish()[0].result, ReportOutcome::NotRun));
+        assert!(matches!(
+            registry.into_checks()[0].outcome,
+            ReportOutcome::NotRun
+        ));
         Ok(())
     }
 
@@ -588,17 +535,20 @@ mod tests {
         let mut fixtures = Fixtures::new()?;
         let events = Rc::new(RefCell::new(Vec::new()));
         let cancellation = CancellationToken::new();
-        let mut registry = TestRegistry::new(cancellation.clone());
+        let mut registry = UpgradeRegistry::default();
         let mut test = FakeTest::new("last", &events);
-        test.cancel_on_run = Some(cancellation);
+        test.cancel_on_run = Some(cancellation.clone());
         test.run = Outcome::Passed;
-        registry.group("fake").register(test);
+        registry.group("fake").register("last", Box::new(test));
         let context = fixtures.context();
-        registry.prepare_before_update(&context, Vec::new()).await?;
-        registry
-            .run_test_hook(&|test| test.run_before_update(&context))
-            .await?;
-        assert!(registry.finish()[0].result.is_passed());
+        prepare_before_update(&mut registry, &context, Vec::new(), &cancellation).await?;
+        run_test_hook(
+            &mut registry,
+            &|test| test.run_before_update(&context),
+            &cancellation,
+        )
+        .await?;
+        assert!(registry.into_checks()[0].outcome.is_passed());
         Ok(())
     }
 }

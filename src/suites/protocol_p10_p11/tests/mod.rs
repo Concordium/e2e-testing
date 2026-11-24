@@ -6,11 +6,10 @@ mod observer_p11_recovery;
 mod staking;
 mod tokens;
 
-use super::registry::TestRegistry;
-use tokio_util::sync::CancellationToken;
+use super::lifecycle::UpgradeRegistry;
 
-pub(super) fn register(cancellation: CancellationToken) -> TestRegistry {
-    let mut registry = TestRegistry::new(cancellation);
+pub(super) fn register() -> UpgradeRegistry {
+    let mut registry = UpgradeRegistry::default();
     new_software_p10_compatibility::register(&mut registry);
     ccd::register(&mut registry);
     staking::register(&mut registry);
