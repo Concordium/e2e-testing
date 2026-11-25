@@ -48,8 +48,10 @@ mod tests {
     async fn failed_start_cleans_up_previously_started_nodes() -> Result<()> {
         let docker = Docker::connect_with_local_defaults()?;
         let image = std::env::var("CONCORDIUM_NEW_IMAGE")?;
-        let genesis =
-            GenesisFixture::single_validator(concordium_rust_sdk::types::ProtocolVersion::P11)?;
+        let genesis = GenesisFixture::single_validator_with_accounts(
+            concordium_rust_sdk::types::ProtocolVersion::P11,
+            1,
+        )?;
         let bytes = concordium_rust_sdk::genesis::serialize_genesis(&genesis.genesis_data);
         let mut nodes = Vec::new();
         let startup = async {

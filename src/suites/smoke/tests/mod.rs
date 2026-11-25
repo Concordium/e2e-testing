@@ -2,6 +2,7 @@
 
 use super::Test;
 use crate::registry::TestRegistry;
+use concordium_rust_sdk::types::ProtocolVersion;
 
 mod accounts;
 mod finalisation;
@@ -9,7 +10,7 @@ mod health;
 mod transfers;
 
 /// Register checks in report order.
-pub fn register() -> TestRegistry<Test> {
+pub fn register(_protocol: ProtocolVersion) -> TestRegistry<Test> {
     let mut registry = TestRegistry::default();
     health::register(&mut registry);
     accounts::register(&mut registry);

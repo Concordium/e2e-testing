@@ -37,9 +37,6 @@ Replace the image placeholders below with Docker image references.
 
 ### Smoke
 
-Checks basic node behavior and connectivity. Use this suite for a quick check
-of a node image.
-
 Smoke requires an explicit protocol version (`10` or `11`). The selected
 protocol controls genesis and which tests run. The image must support that
 protocol.

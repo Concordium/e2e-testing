@@ -12,13 +12,17 @@ mod tests;
 
 use super::shutdown_signal;
 use crate::fixture::{
-    genesis::GenesisFixture,
+    genesis::{GenesisAccount, GenesisFixture},
     node::{NodeConfig, NodeFixture},
 };
 use crate::report::{Check, Outcome, SuiteReport};
 use anyhow::{Context, Result};
 use bollard::Docker;
-use concordium_rust_sdk::types::{ProtocolVersion, queries::ProtocolVersionInt};
+use concordium_rust_sdk::{
+    genesis::output::GeneratedKeyPair,
+    id::types::AccountAddress,
+    types::{ProtocolVersion, queries::ProtocolVersionInt},
+};
 use std::time::Instant;
 
 use std::{future::Future, pin::Pin};
@@ -28,14 +32,18 @@ pub type TestFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>
 
 /// One named smoke check, run concurrently with the other registered checks.
 pub struct Test {
+    /// Number of exclusive funded regular accounts required by this check.
+    pub required_accounts: usize,
     /// Run this check against the suite's shared chain.
-    pub run: Box<dyn for<'a> Fn(&'a Fixtures) -> TestFuture<'a> + Send>,
+    pub run: Box<dyn for<'a> Fn(&'a TestContext, Vec<GenesisAccount>) -> TestFuture<'a> + Send>,
 }
 
-/// Genesis keys and the running node shared by smoke checks.
-pub struct Fixtures {
-    /// Genesis accounts and keys used to sign test transactions.
-    pub(crate) genesis: GenesisFixture,
+/// Public account addresses, governance keys, and the node shared by smoke checks.
+pub struct TestContext {
+    /// Genesis addresses in order, with the validator first.
+    pub(crate) accounts: Vec<AccountAddress>,
+    /// Hold the lock from token-creation sequence lookup through finalization.
+    pub(crate) governance: tokio::sync::Mutex<Vec<GeneratedKeyPair>>,
     /// The running validator node.
     pub(crate) validator_node: NodeFixture,
 }
@@ -45,7 +53,7 @@ pub struct Fixtures {
 /// Always stops the node container before returning, regardless of outcome.
 pub async fn run(image: &str, protocol: ProtocolVersion) -> Result<SuiteReport> {
     let started = Instant::now();
-    let mut registry = tests::register();
+    let mut registry = tests::register(protocol);
     // Install signal handlers before creating any Docker resources. A signal
     // received during startup is retained until the container can be cleaned up.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -63,7 +71,23 @@ pub async fn run(image: &str, protocol: ProtocolVersion) -> Result<SuiteReport> 
 
     // ── Step 1: Generate genesis ──────────────────────────────────────────
     tracing::info!("generating genesis block...");
-    let genesis = GenesisFixture::single_validator(protocol)?;
+    let account_count = registry
+        .entries()
+        .iter()
+        .try_fold(0usize, |total, entry| {
+            total.checked_add(entry.definition.required_accounts)
+        })
+        .context("Smoke account count overflow")?;
+    let genesis = GenesisFixture::single_validator_with_accounts(
+        protocol,
+        account_count
+            .try_into()
+            .context("Too many smoke accounts")?,
+    )?;
+    anyhow::ensure!(
+        genesis.accounts.len().checked_sub(1) == Some(account_count),
+        "Genesis regular-account count does not match smoke requirements"
+    );
     tracing::debug!(
         validators = genesis.validators.len(),
         accounts = genesis.accounts.len(),
@@ -123,21 +147,31 @@ pub async fn run(image: &str, protocol: ProtocolVersion) -> Result<SuiteReport> 
         };
     }
 
-    let fixtures = Fixtures {
-        genesis,
+    let fixtures = TestContext {
+        accounts: genesis
+            .accounts
+            .iter()
+            .map(|account| account.address)
+            .collect(),
+        governance: tokio::sync::Mutex::new(genesis.governance_keys),
         validator_node: node,
     };
 
     // ── Step 4: Collect and run tests ─────────────────────────────────────────
 
+    let mut accounts = genesis.accounts.into_iter().skip(1);
     let execution =
         futures_util::future::join_all(registry.entries_mut().iter_mut().map(|entry| {
             let fixtures = &fixtures;
+            let assigned = accounts
+                .by_ref()
+                .take(entry.definition.required_accounts)
+                .collect();
             async move {
                 let check = &mut entry.check;
                 tracing::info!(test = check.name, "running test");
                 check.outcome = Outcome::Incomplete;
-                check.outcome = match (entry.definition.run)(fixtures).await {
+                check.outcome = match (entry.definition.run)(fixtures, assigned).await {
                     Ok(()) => {
                         tracing::info!(test = check.name, "PASS");
                         Outcome::Passed

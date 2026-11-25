@@ -55,11 +55,14 @@ impl GenesisFixture {
     ///
     /// Creates:
     /// - 1 validator account (balance 3.5M CCD, staking 3M CCD)
-    /// - 1 funded regular account (100k CCD)
+    /// - The requested number of funded regular accounts (100k CCD each)
     /// - 1 identity provider and 1 anonymity revoker
     /// - Governance keys with 2-of-3 thresholds
-    pub fn single_validator(protocol: ProtocolVersion) -> Result<Self> {
-        Self::build(protocol, 1, 1, 3_600_000)
+    pub fn single_validator_with_accounts(
+        protocol: ProtocolVersion,
+        regular_account_count: u32,
+    ) -> Result<Self> {
+        Self::build(protocol, 1, regular_account_count, 3_600_000)
     }
 
     /// Generate four P10 validators and the regular accounts requested by protocol tests.
