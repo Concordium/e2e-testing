@@ -21,9 +21,9 @@ use concordium_rust_sdk::{
         AmountFraction, BakerCredentials, CapitalBound, CommissionRanges, CooldownParameters,
         DurationSeconds, Energy, Epoch, ExchangeRate, FinalizationCommitteeParameters,
         GASRewardsV1, InclusiveRange, LeverageFactor, MintDistributionV1, MintRate,
-        PartsPerHundredThousands, PoolParameters, RewardPeriodLength, TimeParameters,
-        TimeoutParameters, TransactionFeeDistribution, UpdateKeysIndex, UpdateKeysThreshold,
-        ValidatorScoreParameters, hashes::LeadershipElectionNonce,
+        PartsPerHundredThousands, PoolParameters, ProtocolVersion, RewardPeriodLength,
+        TimeParameters, TimeoutParameters, TransactionFeeDistribution, UpdateKeysIndex,
+        UpdateKeysThreshold, ValidatorScoreParameters, hashes::LeadershipElectionNonce,
     },
 };
 
@@ -51,32 +51,41 @@ pub struct GenesisFixture {
 // ── Construction ──────────────────────────────────────────────────────────────
 
 impl GenesisFixture {
-    /// Generate a fresh P10 single-validator genesis block timestamped to now.
+    /// Generate a fresh single-validator genesis block timestamped to now.
     ///
     /// Creates:
     /// - 1 validator account (balance 3.5M CCD, staking 3M CCD)
-    /// - 1 funded regular account (100k CCD)
+    /// - The requested number of funded regular accounts (100k CCD each)
     /// - 1 identity provider and 1 anonymity revoker
     /// - Governance keys with 2-of-3 thresholds
-    pub fn single_validator_p10() -> Result<Self> {
-        Self::build_p10(1, 1, 3_600_000)
+    pub fn single_validator_with_accounts(
+        protocol: ProtocolVersion,
+        regular_account_count: u32,
+    ) -> Result<Self> {
+        Self::build(protocol, 1, regular_account_count, 3_600_000)
     }
 
     /// Generate four P10 validators and the regular accounts requested by protocol tests.
     pub fn four_validator_p10_with_accounts(regular_account_count: u32) -> Result<Self> {
-        Self::build_p10(4, regular_account_count, 30_000)
+        Self::build(ProtocolVersion::P10, 4, regular_account_count, 30_000)
     }
 
-    /// Build P10 genesis data with equal validator stakes. Durations use milliseconds.
+    /// Build P10 or P11 genesis data with equal validator stakes. Durations use milliseconds.
     /// The validator count must be at least one.
-    fn build_p10(
+    fn build(
+        protocol: ProtocolVersion,
         validator_count: u32,
         regular_account_count: u32,
         epoch_duration_ms: u64,
     ) -> Result<Self> {
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
 
-        let builder = genesis::genesis_builder_p10()
+        let builder = match protocol {
+            ProtocolVersion::P10 => genesis::genesis_builder_p10(),
+            ProtocolVersion::P11 => genesis::genesis_builder_p11(),
+            _ => anyhow::bail!("Unsupported genesis fixture protocol: {protocol:?}"),
+        };
+        let builder = builder
             .generate_crypto_params("concordium-e2e-test".to_string())
             .generate_identity_providers(IpIdentity::from(0), 1)
             .generate_anonymity_revokers(
@@ -124,15 +133,17 @@ impl GenesisFixture {
         } else {
             builder
         };
+        let mut governance_keys = make_governance_keys();
+        let mut parameters = make_protocol_params(now_ms, validator_count, epoch_duration_ms);
+        if protocol == ProtocolVersion::P11 {
+            governance_keys.level2.token_parameters = Some(make_access(&[0, 1, 2], 2));
+            parameters.chain.max_lock_duration = Some(Duration::from_millis(86_400_000));
+        }
         let output = builder
-            .generate_governance_keys(make_governance_keys())
-            .with_protocol(make_protocol_params(
-                now_ms,
-                validator_count,
-                epoch_duration_ms,
-            ))
+            .generate_governance_keys(governance_keys)
+            .with_protocol(parameters)
             .build()
-            .context("Failed to build P10 genesis block")?;
+            .with_context(|| format!("Failed to build {protocol:?} genesis block"))?;
 
         let validators = output
             .baker_credentials

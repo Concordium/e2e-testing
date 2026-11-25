@@ -1,4 +1,5 @@
-use super::super::Fixtures;
+use super::super::TestContext;
+use crate::fixture::genesis::GenesisAccount;
 use anyhow::{Context, ensure};
 use concordium_rust_sdk::{
     common::types::{Amount, TransactionTime},
@@ -7,12 +8,27 @@ use concordium_rust_sdk::{
 };
 use std::time::Duration;
 
+pub(super) fn register(registry: &mut crate::registry::TestRegistry<super::Test>) {
+    registry.group("CCD transfers").register(
+        "Transfer is finalized",
+        super::Test {
+            required_accounts: 1,
+            run: Box::new(|fixtures, accounts| {
+                Box::pin(ccd_transfer_is_finalised(fixtures, accounts))
+            }),
+        },
+    );
+}
+
 const TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSFER_AMOUNT: Amount = Amount::from_micro_ccd(1_000_000);
 
-pub async fn ccd_transfer_is_finalised(fixtures: &Fixtures) -> anyhow::Result<()> {
-    let sender = &fixtures.genesis.accounts[1];
-    let recipient_address = fixtures.genesis.accounts[0].address;
+async fn ccd_transfer_is_finalised(
+    fixtures: &TestContext,
+    accounts: Vec<GenesisAccount>,
+) -> anyhow::Result<()> {
+    let sender = &accounts[0];
+    let recipient_address = fixtures.accounts[0];
 
     let mut client = fixtures.validator_node.connect().await?;
     let recipient_before = client

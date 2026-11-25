@@ -1,6 +1,6 @@
 //! New software follows pre-update operations produced by old-software validators.
 use super::super::{
-    registry::{CleanupContext, ProtocolUpgradeTest, TestContext, TestProgress, TestRegistry},
+    lifecycle::{CleanupContext, ProtocolUpgradeTest, TestContext, TestProgress, UpgradeRegistry},
     state::FinalizedBlock,
     wait,
 };
@@ -10,10 +10,10 @@ use crate::fixture::{
 };
 use anyhow::{Context, Result, ensure};
 
-pub(super) fn register(registry: &mut TestRegistry) {
+pub(super) fn register(registry: &mut UpgradeRegistry) {
     registry
         .group("New software compatibility with P10")
-        .register(NewSoftwareP10Compatibility::default());
+        .register("New software catches up with operations from old-software validators before the update", Box::new(NewSoftwareP10Compatibility::default()));
 }
 
 #[derive(Default)]
@@ -23,11 +23,6 @@ struct NewSoftwareP10Compatibility {
 
 #[async_trait::async_trait(?Send)]
 impl ProtocolUpgradeTest for NewSoftwareP10Compatibility {
-    fn name(&self) -> String {
-        "New software catches up with operations from old-software validators before the update"
-            .into()
-    }
-
     async fn prepare_before_update(
         &mut self,
         context: &TestContext<'_>,

@@ -1,11 +1,21 @@
-use super::super::Fixtures;
+use super::super::TestContext;
 use anyhow::{Context, bail};
 use std::time::Duration;
+
+pub(super) fn register(registry: &mut crate::registry::TestRegistry<super::Test>) {
+    registry.group("Finalization").register(
+        "Last finalized block advances",
+        super::Test {
+            required_accounts: 0,
+            run: Box::new(|fixtures, _accounts| Box::pin(last_finalised_block_advances(fixtures))),
+        },
+    );
+}
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub async fn last_finalised_block_advances(fixtures: &Fixtures) -> anyhow::Result<()> {
+async fn last_finalised_block_advances(fixtures: &TestContext) -> anyhow::Result<()> {
     let mut client = fixtures.validator_node.connect().await?;
     let initial = client
         .get_consensus_info()

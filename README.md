@@ -3,9 +3,9 @@
 End-to-end suites for the Concordium node. Each suite generates a fresh private
 chain and cleans up its Docker resources regardless of outcome:
 
-- **Smoke:** single-validator chain with basic node-interface checks.
-- **P10 → P11 continuity:** four validators and an observer, rolling software
-  upgrades, prepared state, protocol activation and observer recovery.
+- **Smoke:** verify core functionality and new-feature behavior.
+- **P10 → P11 continuity:** verify that protocol activation preserves existing
+  state and capabilities while enabling new functionality.
 
 ## Prerequisites
 
@@ -37,11 +37,12 @@ Replace the image placeholders below with Docker image references.
 
 ### Smoke
 
-Checks basic node behavior and connectivity. Use this suite for a quick check
-of a node image.
+Smoke requires an explicit protocol version (`10` or `11`). The selected
+protocol controls genesis and which tests run. The image must support that
+protocol.
 
 ```sh
-cargo run --release -- smoke --image NODE_IMAGE
+cargo run --release -- smoke --image NODE_IMAGE --protocol 11
 ```
 
 ### P10 → P11 continuity

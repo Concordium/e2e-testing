@@ -1,5 +1,5 @@
 //! Passive delegation and reward-aware staking preservation across the update.
-use super::super::registry::{ProtocolUpgradeTest, TestContext, TestProgress, TestRegistry};
+use super::super::lifecycle::{ProtocolUpgradeTest, TestContext, TestProgress, UpgradeRegistry};
 use super::super::{
     REJOIN_TIMEOUT, operations,
     state::{FinalizedBlock, rewards_between},
@@ -14,10 +14,11 @@ use concordium_rust_sdk::{
 };
 use std::collections::BTreeMap;
 
-pub(super) fn register(registry: &mut TestRegistry) {
-    registry
-        .group("Staking")
-        .register(StakingContinuity::default());
+pub(super) fn register(registry: &mut UpgradeRegistry) {
+    registry.group("Staking").register(
+        "Passive delegation and reward-aware staking preservation across P11",
+        Box::new(StakingContinuity::default()),
+    );
 }
 
 #[derive(Default)]
@@ -28,9 +29,6 @@ struct StakingContinuity {
 
 #[async_trait::async_trait(?Send)]
 impl ProtocolUpgradeTest for StakingContinuity {
-    fn name(&self) -> String {
-        "Passive delegation and reward-aware staking preservation across P11".into()
-    }
     fn required_accounts(&self) -> usize {
         1
     }

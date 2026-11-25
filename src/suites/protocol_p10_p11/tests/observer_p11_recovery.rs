@@ -1,7 +1,7 @@
 //! Recover an observer from unsupported P11 activation while retaining its database.
 use super::super::{
     REJOIN_TIMEOUT,
-    registry::{CleanupContext, ProtocolUpgradeTest, TestContext, TestProgress, TestRegistry},
+    lifecycle::{CleanupContext, ProtocolUpgradeTest, TestContext, TestProgress, UpgradeRegistry},
     state::FinalizedBlock,
     wait,
 };
@@ -21,10 +21,10 @@ use concordium_rust_sdk::{
 use futures_util::TryStreamExt;
 use std::collections::BTreeMap;
 
-pub(super) fn register(registry: &mut TestRegistry) {
+pub(super) fn register(registry: &mut UpgradeRegistry) {
     registry
         .group("Observer recovery after unsupported P11 activation")
-        .register(ObserverP11Recovery::default());
+        .register("An old-software observer stops at P11 activation, then catches up after a database-preserving software upgrade and matches validator chain, CCD, staking, and token state", Box::new(ObserverP11Recovery::default()));
 }
 
 /// Let the healthy observer initiate connections to validators.
@@ -55,10 +55,6 @@ struct ObserverP11Recovery {
 
 #[async_trait::async_trait(?Send)]
 impl ProtocolUpgradeTest for ObserverP11Recovery {
-    fn name(&self) -> String {
-        "An old-software observer stops at P11 activation, then catches up after a database-preserving software upgrade and matches validator chain, CCD, staking, and token state".into()
-    }
-
     async fn prepare_before_update(
         &mut self,
         context: &TestContext<'_>,

@@ -45,7 +45,7 @@ Run cleanup hooks for tests whose preparation started, in reverse order
 Clean up validators
 ```
 
-Each phase is a global barrier. Tests hooks run concurrently and the framework does not enter the next phase until every hook is complete from the current phase.
+Each phase is a global barrier. The framework does not enter the next phase until every hook in the current phase is complete.
 
 ## Implement a test
 

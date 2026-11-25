@@ -1,10 +1,29 @@
-use super::super::Fixtures;
+use super::super::TestContext;
 use anyhow::{Context, ensure};
 use std::time::Duration;
 
+pub(super) fn register(registry: &mut crate::registry::TestRegistry<super::Test>) {
+    registry
+        .group("Health")
+        .register(
+            "Node is reachable",
+            super::Test {
+                required_accounts: 0,
+                run: Box::new(|fixtures, _accounts| Box::pin(node_is_reachable(fixtures))),
+            },
+        )
+        .register(
+            "Node produces blocks",
+            super::Test {
+                required_accounts: 0,
+                run: Box::new(|fixtures, _accounts| Box::pin(node_produces_blocks(fixtures))),
+            },
+        );
+}
+
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-pub async fn node_is_reachable(fixtures: &Fixtures) -> anyhow::Result<()> {
+async fn node_is_reachable(fixtures: &TestContext) -> anyhow::Result<()> {
     let mut client = fixtures.validator_node.connect().await?;
     tokio::time::timeout(TIMEOUT, client.get_node_info())
         .await
@@ -12,7 +31,7 @@ pub async fn node_is_reachable(fixtures: &Fixtures) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn node_produces_blocks(fixtures: &Fixtures) -> anyhow::Result<()> {
+async fn node_produces_blocks(fixtures: &TestContext) -> anyhow::Result<()> {
     let mut client = fixtures.validator_node.connect().await?;
     let info = tokio::time::timeout(TIMEOUT, client.get_consensus_info())
         .await
