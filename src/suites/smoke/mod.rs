@@ -30,12 +30,16 @@ use std::{future::Future, pin::Pin};
 /// A test operation that can borrow the suite fixtures.
 pub type TestFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 
+/// A smoke check that consumes exclusive accounts and borrows shared fixtures.
+pub type TestRun =
+    Box<dyn for<'a> Fn(&'a TestContext, Vec<GenesisAccount>) -> TestFuture<'a> + Send>;
+
 /// One named smoke check, run concurrently with the other registered checks.
 pub struct Test {
     /// Number of exclusive funded regular accounts required by this check.
     pub required_accounts: usize,
     /// Run this check against the suite's shared chain.
-    pub run: Box<dyn for<'a> Fn(&'a TestContext, Vec<GenesisAccount>) -> TestFuture<'a> + Send>,
+    pub run: TestRun,
 }
 
 /// Public account addresses, governance keys, and the node shared by smoke checks.

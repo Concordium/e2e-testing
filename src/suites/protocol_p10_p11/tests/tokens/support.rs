@@ -148,7 +148,7 @@ mod unit_tests {
         let old = TokenInfo {
             token_id: TokenId::try_from("E2E-NORMALIZE".to_string())?,
             token_state: TokenState {
-                token_module_ref: crate::suites::protocol_p10_p11::payload::TOKEN_MODULE.parse()?,
+                token_module_ref: crate::operations::TOKEN_MODULE.parse()?,
                 decimals: 0,
                 total_supply: TokenAmount::from_raw(1000, 0),
                 module_state: cbor_encode(&module).into(),

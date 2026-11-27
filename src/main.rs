@@ -3,6 +3,7 @@ use clap::Parser;
 
 mod cli;
 mod fixture;
+mod operations;
 mod registry;
 mod report;
 mod suites;

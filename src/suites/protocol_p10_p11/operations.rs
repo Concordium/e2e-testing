@@ -1,6 +1,7 @@
 //! Small finalized operations used before, during and after upgrades.
-use super::{TRANSACTION_TIMEOUT, payload};
+use super::TRANSACTION_TIMEOUT;
 use crate::fixture::genesis::GenesisAccount;
+use crate::operations::expiry;
 use anyhow::{Context, Result, ensure};
 use concordium_rust_sdk::{
     base::{
@@ -19,14 +20,9 @@ use concordium_rust_sdk::{
         hashes::BlockHash,
         transactions::{BlockItem, ConfigureDelegationPayload, EncodedPayload, send},
     },
-    v2::{BlockIdentifier, Client},
+    v2::Client,
 };
 use std::collections::BTreeMap;
-
-/// Set the transaction expiry to five minutes after the current UTC time.
-pub fn expiry() -> TransactionTime {
-    TransactionTime::from_seconds((chrono::Utc::now().timestamp() + 300) as u64)
-}
 
 /// Submit an item and require a successful finalized result. Return its block hash.
 pub async fn submit(
@@ -198,25 +194,30 @@ pub async fn create_token(
         mintable: Some(true),
         burnable: Some(true),
     };
-    let sequence = client
-        .get_next_update_sequence_numbers(BlockIdentifier::LastFinal)
-        .await?
-        .response
-        .protocol_level_tokens;
-    governance(
-        client,
-        governance_keys,
-        sequence,
-        TransactionTime::from_seconds(0),
-        UpdatePayload::CreatePlt(CreatePlt {
-            token_id: id.clone(),
-            token_module: payload::TOKEN_MODULE.parse()?,
-            decimals: 0,
-            initialization_parameters: cbor_encode(&parameters).into(),
-        }),
-        "create-token",
+    let (_, summary) = tokio::time::timeout(
+        TRANSACTION_TIMEOUT,
+        crate::operations::create_token(
+            client,
+            governance_keys,
+            CreatePlt {
+                token_id: id.clone(),
+                token_module: crate::operations::TOKEN_MODULE.parse()?,
+                decimals: 0,
+                initialization_parameters: cbor_encode(&parameters).into(),
+            },
+        ),
     )
-    .await?;
+    .await
+    .with_context(|| {
+        format!(
+            "create-token: creation did not finalize within {} seconds",
+            TRANSACTION_TIMEOUT.as_secs()
+        )
+    })??;
+    ensure!(
+        summary.is_success().as_known() == Some(&true),
+        "create-token: unsuccessful or unknown outcome: {summary:?}"
+    );
     Ok(())
 }
 

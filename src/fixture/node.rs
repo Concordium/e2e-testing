@@ -92,6 +92,7 @@ get_peers_info = true
 get_node_info = true
 get_account_info = true
 get_token_info = true
+get_token_authorizations = true
 get_token_list = true
 get_consensus_info = true
 get_block_info = true

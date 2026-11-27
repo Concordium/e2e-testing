@@ -13,8 +13,6 @@ pub const SPECIFICATION_HASH: &str =
     "000000000000000000000000000000000000000000000000000000000000000b";
 /// Source revision whose P10.ProtocolP11 implementation defines this fixture.
 pub const SOURCE_REVISION: &str = "dd095ef7b90ca3101b5e37c7e1c61224356e35de";
-/// Token module reference accepted by the P10 token-creation update.
-pub const TOKEN_MODULE: &str = "5c5c2645db84a7026d78f2501740f60a8ccb8fae5c166dc2428077fd9a699a4a";
 
 /// Build the revision-specific update with 2-of-3 access and a one-day maximum lock duration.
 pub fn protocol_update() -> Result<ProtocolUpdate> {
